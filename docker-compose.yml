@@ -1,12 +1,22 @@
 version: "3.9"
 
+# ---------------------------------------------------------------------------
+# Shared network so all containers can resolve each other by service name.
+# ---------------------------------------------------------------------------
+networks:
+  metaweave:
+    driver: bridge
+
 services:
+  # --------------------------------------------------------------------------
+  # Infrastructure
+  # --------------------------------------------------------------------------
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:9000"   # S3-compatible API (also accessible from the host)
+      - "9001:9001"   # MinIO Console
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -17,25 +27,74 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - metaweave
 
   neo4j:
     image: neo4j:5
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "7474:7474"   # HTTP / Browser
+      - "7687:7687"   # Bolt
     environment:
       NEO4J_AUTH: neo4j/metaweave
     volumes:
       - neo4j_data:/data
+    networks:
+      - metaweave
 
   qdrant:
     image: qdrant/qdrant:latest
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
     volumes:
       - qdrant_data:/qdrant/storage
+    networks:
+      - metaweave
 
+  # --------------------------------------------------------------------------
+  # Backend (FastAPI)
+  # --------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Internal MinIO endpoint (resolved via Docker DNS).
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      # Public endpoint rewrite: browsers on the host cannot resolve "minio",
+      # so pre-signed URLs are rewritten to use localhost:9000 instead.
+      MINIO_PUBLIC_ENDPOINT: localhost:9000
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - metaweave
+    restart: on-failure
+
+  # --------------------------------------------------------------------------
+  # Frontend (Streamlit)
+  # --------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "8501:8501"
+    environment:
+      # Resolved via Docker DNS inside the metaweave network.
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - metaweave
+    restart: on-failure
+
+# ---------------------------------------------------------------------------
+# Persistent volumes
+# ---------------------------------------------------------------------------
 volumes:
   minio_data:
   neo4j_data:
