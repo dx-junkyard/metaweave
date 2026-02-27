@@ -29,6 +29,7 @@ class StorageManager:
         endpoint = os.environ.get("MINIO_ENDPOINT", "localhost:9000")
         access_key = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
         secret_key = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
+        self._public_endpoint = os.environ.get("MINIO_PUBLIC_ENDPOINT", "localhost:9000")
 
         self.client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=False)
         self._ensure_buckets()
@@ -61,20 +62,29 @@ class StorageManager:
     # ------------------------------------------------------------------
     # Pre-signed URL
     # ------------------------------------------------------------------
-
     def presigned_url(
         self,
         bucket: str,
         object_name: str,
         expires: timedelta = timedelta(hours=1),
     ) -> str:
-        """Return a pre-signed GET URL.
+        # MinIOに対して、署名計算時に使用する Host ヘッダーを強制する。
+        # こうすることで、ブラウザから 'localhost:9000' でアクセスしても署名エラーにならない。
+        url = self.client.presigned_get_object(
+            bucket, 
+            object_name, 
+            expires=expires,
+            # ここが最重要ポイント
+            extra_query_params={"host": self._public_endpoint} 
+        )
+        
+        # 最後に、URLのドメイン部分を minio:9000 から localhost:9000 に置換する
+        internal_endpoint = os.environ.get("MINIO_ENDPOINT", "minio:9000")
+        if internal_endpoint != self._public_endpoint:
+             url = url.replace(internal_endpoint, self._public_endpoint, 1)
+             
+        return url
 
-        Because the client is initialised with ``localhost:9000`` (the same
-        host the browser uses), the generated URL is immediately valid in the
-        browser — no hostname rewriting required.
-        """
-        return self.client.presigned_get_object(bucket, object_name, expires=expires)
 
     # ------------------------------------------------------------------
     # Listing

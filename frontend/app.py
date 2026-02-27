@@ -349,7 +349,11 @@ elif page == "Validation View":
                     st.markdown("**PDF Preview**")
                     try:
                         pdf_url = api_presigned_url(object_name)
-                        components.iframe(pdf_url, height=720, scrolling=True)
+                        # components.iframe をやめ、st.markdown で直接標準の iframe を描画する
+                        st.markdown(
+                            f'<iframe src="{pdf_url}" width="100%" height="720px" style="border: none;"></iframe>',
+                            unsafe_allow_html=True,
+                        )
                     except Exception as exc:
                         st.error(f"Could not load PDF: {exc}")
 
