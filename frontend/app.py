@@ -141,10 +141,77 @@ _STATUS_LABEL: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Sidebar navigation
+# Sidebar — Navigation + Paper list (Validation View)
 # ---------------------------------------------------------------------------
 
-page = st.sidebar.radio("Navigation", ["Harvester Dashboard", "Validation View"])
+with st.sidebar:
+    st.markdown("## MetaWeave v1")
+    page = st.radio("Navigation", ["Harvester Dashboard", "Validation View"])
+
+    if page == "Validation View":
+        st.divider()
+
+        # Build paper registry for sidebar list
+        _stored_sidebar: dict[str, str] = dict(st.session_state.stored_papers)
+        try:
+            _remote_sidebar = api_list_papers()
+            for _obj_s in _remote_sidebar:
+                _safe_id_s = _obj_s.rsplit("/", 1)[-1].replace(".pdf", "")
+                _stored_sidebar.setdefault(_safe_id_s, _obj_s)
+        except Exception:
+            pass
+
+        st.markdown("### Papers")
+        _search_text = st.text_input(
+            "Search",
+            placeholder="Filter by title or ID…",
+            label_visibility="collapsed",
+        )
+        _status_filter = st.selectbox(
+            "Status filter",
+            ["All", "Pending", "Approved", "Rejected"],
+            label_visibility="collapsed",
+        )
+        st.markdown("---")
+
+        for _aid, _obj_s in _stored_sidebar.items():
+            _s = st.session_state.structures.get(_aid, {})
+            _status = _s.get("review_status", "pending")
+
+            if _status_filter != "All" and _status != _status_filter.lower():
+                continue
+
+            _title: str = (
+                st.session_state.paper_metadata.get(_aid, {}).get("title")
+                or _s.get("title")
+                or _aid
+            )
+
+            if _search_text and (
+                _search_text.lower() not in _title.lower()
+                and _search_text.lower() not in _aid.lower()
+            ):
+                continue
+
+            _icon = _STATUS_ICON.get(_status, "🟡")
+            _label = f"{_icon} {_title}" if len(_title) <= 34 else f"{_icon} {_title[:31]}…"
+            _is_active = _aid == st.session_state.active_paper_id
+
+            if st.button(
+                _label,
+                key=f"sel_{_aid}",
+                use_container_width=True,
+                type="primary" if _is_active else "secondary",
+            ):
+                st.session_state.active_paper_id = _aid
+                if _aid not in st.session_state.structures:
+                    with st.spinner("Loading…"):
+                        try:
+                            _result = api_get_extract_result(_aid)
+                            st.session_state.structures[_aid] = _result
+                        except Exception:
+                            st.session_state.structures[_aid] = _empty_structure(_aid)
+                st.rerun()
 
 # =========================================================================
 # Page A — Harvester Dashboard
@@ -209,16 +276,11 @@ if page == "Harvester Dashboard":
 # Page B — Validation View
 # =========================================================================
 elif page == "Validation View":
-    st.header("Structure Validation")
-
     # Build unified paper registry: safe_id / arxiv_id -> object_name
     stored: dict[str, str] = dict(st.session_state.stored_papers)
-
-    # Enrich from backend listing (best-effort); derive key from filename
     try:
         remote = api_list_papers()
         for obj in remote:
-            # "arxiv/2024/2401.12345.pdf" → safe_id = "2401.12345"
             safe_id = obj.rsplit("/", 1)[-1].replace(".pdf", "")
             stored.setdefault(safe_id, obj)
     except Exception:
@@ -227,255 +289,197 @@ elif page == "Validation View":
     if not stored:
         st.info("No papers stored yet. Use the **Harvester Dashboard** to fetch papers first.")
     else:
-        # ----- Layout: paper list (25%) | main area (75%) -----
-        list_col, main_col = st.columns([1, 3])
+        active_id = st.session_state.active_paper_id
 
-        # ── Left panel: paper list ──────────────────────────────────────────
-        with list_col:
-            st.markdown("### Papers")
-            search_text = st.text_input(
-                "Search", placeholder="Filter by title or ID…", label_visibility="collapsed"
+        if not active_id or active_id not in stored:
+            st.info("← Select a paper from the sidebar to view and edit its structure.")
+        else:
+            object_name = stored[active_id]
+            s = st.session_state.structures.get(active_id, _empty_structure(active_id))
+            status = s.get("review_status", "pending")
+            title = (
+                st.session_state.paper_metadata.get(active_id, {}).get("title")
+                or s.get("title")
+                or active_id
             )
-            status_filter = st.selectbox(
-                "Status filter",
-                ["All", "Pending", "Approved", "Rejected"],
-                label_visibility="collapsed",
+
+            # ── Header: prominent title + arXiv ID ───────────────────────────
+            st.title(title)
+            st.caption(
+                f"arXiv ID: `{active_id}`  |  Status: {_STATUS_LABEL.get(status, '🟡 Pending')}"
             )
 
-            st.markdown("---")
-
-            for aid, _obj in stored.items():
-                s = st.session_state.structures.get(aid, {})
-                status = s.get("review_status", "pending")
-
-                # Apply status filter
-                if status_filter != "All" and status != status_filter.lower():
-                    continue
-
-                # Resolve display title
-                title: str = (
-                    st.session_state.paper_metadata.get(aid, {}).get("title")
-                    or s.get("title")
-                    or aid
-                )
-
-                # Apply text search
-                if search_text and (
-                    search_text.lower() not in title.lower()
-                    and search_text.lower() not in aid.lower()
-                ):
-                    continue
-
-                icon = _STATUS_ICON.get(status, "🟡")
-                label = f"{icon} {title}" if len(title) <= 34 else f"{icon} {title[:31]}…"
-                is_active = aid == st.session_state.active_paper_id
-
-                if st.button(
-                    label,
-                    key=f"sel_{aid}",
-                    use_container_width=True,
-                    type="primary" if is_active else "secondary",
-                ):
-                    st.session_state.active_paper_id = aid
-                    # Load from MinIO if not already in session state
-                    if aid not in st.session_state.structures:
-                        with st.spinner("Loading saved data…"):
-                            try:
-                                result = api_get_extract_result(aid)
-                                st.session_state.structures[aid] = result
-                            except Exception:
-                                st.session_state.structures[aid] = _empty_structure(aid)
-                    st.rerun()
-
-        # ── Right panel: PDF preview + structure editor ─────────────────────
-        with main_col:
-            active_id = st.session_state.active_paper_id
-
-            if not active_id or active_id not in stored:
-                st.info("← Select a paper from the list to view and edit its structure.")
-            else:
-                object_name = stored[active_id]
-                s = st.session_state.structures.get(active_id, _empty_structure(active_id))
-                status = s.get("review_status", "pending")
-                title = (
-                    st.session_state.paper_metadata.get(active_id, {}).get("title")
-                    or s.get("title")
-                    or active_id
-                )
-
-                # Header: title, status badge, and action buttons
-                header_col, action_col = st.columns([3, 2])
-                with header_col:
-                    st.subheader(title)
-                    st.caption(f"ID: `{active_id}`  |  Status: {_STATUS_LABEL.get(status, '🟡 Pending')}")
-
-                with action_col:
-                    act1, act2, act3 = st.columns(3)
-                    with act1:
-                        if st.button("✅ Approve", use_container_width=True, key="btn_approve"):
-                            s["review_status"] = "approved"
-                            st.session_state.structures[active_id] = s
-                            try:
-                                api_update_extract_result(active_id, s)
-                            except Exception as exc:
-                                st.warning(f"Backend sync failed: {exc}")
-                            st.rerun()
-                    with act2:
-                        if st.button("❌ Reject", use_container_width=True, key="btn_reject"):
-                            s["review_status"] = "rejected"
-                            st.session_state.structures[active_id] = s
-                            try:
-                                api_update_extract_result(active_id, s)
-                            except Exception as exc:
-                                st.warning(f"Backend sync failed: {exc}")
-                            st.rerun()
-                    with act3:
-                        if st.button("🔄 Re-Extract", use_container_width=True, key="btn_reextract"):
-                            try:
-                                with st.spinner("Re-extracting…"):
-                                    result = api_extract(object_name, active_id)
-                                    st.session_state.structures[active_id] = result
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(f"Re-extraction failed: {exc}")
-
-                st.divider()
-
-                # Two-column: PDF preview (40%) | structure editor (60%)
-                pdf_col, edit_col = st.columns([2, 3])
-
-                # ── PDF preview ──────────────────────────────────────────────
-                with pdf_col:
-                    st.markdown("**PDF Preview**")
+            # ── Action buttons (right-aligned) ───────────────────────────────
+            _, act1, act2, act3 = st.columns([6, 1, 1, 1])
+            with act1:
+                if st.button("✅ Approve", use_container_width=True, key="btn_approve"):
+                    s["review_status"] = "approved"
+                    st.session_state.structures[active_id] = s
                     try:
-                        pdf_url = api_presigned_url(object_name)
-                        # components.iframe をやめ、st.markdown で直接標準の iframe を描画する
-                        st.markdown(
-                            f'<iframe src="{pdf_url}" width="100%" height="720px" style="border: none;"></iframe>',
-                            unsafe_allow_html=True,
-                        )
+                        api_update_extract_result(active_id, s)
                     except Exception as exc:
-                        st.error(f"Could not load PDF: {exc}")
+                        st.warning(f"Backend sync failed: {exc}")
+                    st.rerun()
+            with act2:
+                if st.button("❌ Reject", use_container_width=True, key="btn_reject"):
+                    s["review_status"] = "rejected"
+                    st.session_state.structures[active_id] = s
+                    try:
+                        api_update_extract_result(active_id, s)
+                    except Exception as exc:
+                        st.warning(f"Backend sync failed: {exc}")
+                    st.rerun()
+            with act3:
+                if st.button("🔄 Re-Extract", use_container_width=True, key="btn_reextract"):
+                    try:
+                        with st.spinner("Re-extracting…"):
+                            result = api_extract(object_name, active_id)
+                            st.session_state.structures[active_id] = result
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Re-extraction failed: {exc}")
 
-                # ── Structure editor ─────────────────────────────────────────
-                with edit_col:
-                    st.markdown("**Extracted Structure**")
+            st.divider()
 
-                    with st.form(f"structure_form_{active_id}"):
-                        with st.expander("Problem Statement", expanded=True):
-                            bg = st.text_area(
-                                "Background",
-                                value=s["problem"]["background"],
-                                height=100,
-                            )
-                            prob = st.text_area(
-                                "Problem",
-                                value=s["problem"]["problem"],
-                                height=100,
-                            )
+            # ── Main 2-column layout [5, 5] ──────────────────────────────────
+            pdf_col, edit_col = st.columns([5, 5])
 
-                        with st.expander("Hypothesis"):
-                            hyp_stmt = st.text_area(
-                                "Statement",
-                                value=s["hypothesis"]["statement"],
-                                height=80,
-                            )
-                            hyp_rat = st.text_area(
-                                "Rationale",
-                                value=s["hypothesis"]["rationale"],
-                                height=80,
-                            )
+            # ── PDF Preview ──────────────────────────────────────────────────
+            with pdf_col:
+                st.markdown("**PDF Preview**")
+                try:
+                    pdf_url = api_presigned_url(object_name)
+                    st.markdown(
+                        f'<iframe src="{pdf_url}" width="100%" height="800px"'
+                        ' style="border:none; border-radius:4px;"></iframe>',
+                        unsafe_allow_html=True,
+                    )
+                except Exception as exc:
+                    st.error(f"Could not load PDF: {exc}")
 
-                        with st.expander("Methodology"):
-                            approach = st.text_area(
-                                "Approach",
-                                value=s["methodology"]["approach"],
-                                height=80,
-                            )
-                            techniques = st.text_area(
-                                "Techniques (one per line)",
-                                value="\n".join(s["methodology"]["techniques"]),
-                                height=80,
-                            )
+            # ── Structure Editor ─────────────────────────────────────────────
+            with edit_col:
+                st.markdown("**Extracted Structure**")
 
-                        with st.expander("Constraints"):
-                            assumptions = st.text_area(
-                                "Assumptions (one per line)",
-                                value="\n".join(s["constraints"]["assumptions"]),
-                                height=80,
-                            )
-                            limitations = st.text_area(
-                                "Limitations (one per line)",
-                                value="\n".join(s["constraints"]["limitations"]),
-                                height=80,
-                            )
+                with st.form(f"structure_form_{active_id}"):
+                    tab1, tab2, tab3 = st.tabs(
+                        ["Problem / Hypothesis", "Method / Constraints", "Abstract / Notes"]
+                    )
 
-                        with st.expander("Abstract Structure"):
-                            variables = st.text_area(
-                                "Variables (one per line)",
-                                value="\n".join(s["abstract_structure"]["variables"]),
-                                height=80,
-                            )
-                            edges_json = st.text_area(
-                                "Edges (JSON list)",
-                                value=json.dumps(s["abstract_structure"]["edges"], indent=2),
-                                height=120,
-                            )
-
-                        with st.expander("Reviewer Notes"):
-                            notes = st.text_area(
-                                "Notes",
-                                value=s.get("reviewer_notes", ""),
-                                height=80,
-                            )
-
-                        save = st.form_submit_button(
-                            "💾 Save edits",
-                            use_container_width=True,
-                            type="primary",
+                    with tab1:
+                        st.markdown("#### Problem Statement")
+                        bg = st.text_area(
+                            "Background",
+                            value=s["problem"]["background"],
+                            height=130,
+                        )
+                        prob = st.text_area(
+                            "Problem",
+                            value=s["problem"]["problem"],
+                            height=130,
+                        )
+                        st.markdown("#### Hypothesis")
+                        hyp_stmt = st.text_area(
+                            "Statement",
+                            value=s["hypothesis"]["statement"],
+                            height=110,
+                        )
+                        hyp_rat = st.text_area(
+                            "Rationale",
+                            value=s["hypothesis"]["rationale"],
+                            height=110,
                         )
 
-                    if save:
-                        try:
-                            edges_parsed = json.loads(edges_json)
-                        except Exception:
-                            edges_parsed = s["abstract_structure"]["edges"]
-                            st.warning("Could not parse edges JSON — kept previous value.")
+                    with tab2:
+                        st.markdown("#### Methodology")
+                        approach = st.text_area(
+                            "Approach",
+                            value=s["methodology"]["approach"],
+                            height=130,
+                        )
+                        techniques = st.text_area(
+                            "Techniques (one per line)",
+                            value="\n".join(s["methodology"]["techniques"]),
+                            height=110,
+                        )
+                        st.markdown("#### Constraints")
+                        assumptions = st.text_area(
+                            "Assumptions (one per line)",
+                            value="\n".join(s["constraints"]["assumptions"]),
+                            height=110,
+                        )
+                        limitations = st.text_area(
+                            "Limitations (one per line)",
+                            value="\n".join(s["constraints"]["limitations"]),
+                            height=110,
+                        )
 
-                        updated: dict = {
-                            "paper_id": active_id,
-                            "title": s.get("title", ""),
-                            "problem": {"background": bg, "problem": prob},
-                            "hypothesis": {"statement": hyp_stmt, "rationale": hyp_rat},
-                            "methodology": {
-                                "approach": approach,
-                                "techniques": [
-                                    t.strip() for t in techniques.splitlines() if t.strip()
-                                ],
-                            },
-                            "constraints": {
-                                "assumptions": [
-                                    a.strip() for a in assumptions.splitlines() if a.strip()
-                                ],
-                                "limitations": [
-                                    l.strip() for l in limitations.splitlines() if l.strip()
-                                ],
-                            },
-                            "abstract_structure": {
-                                "variables": [
-                                    v.strip() for v in variables.splitlines() if v.strip()
-                                ],
-                                "edges": edges_parsed,
-                            },
-                            "review_status": s.get("review_status", "pending"),
-                            "reviewer_notes": notes,
-                        }
-                        st.session_state.structures[active_id] = updated
+                    with tab3:
+                        st.markdown("#### Abstract Structure")
+                        variables = st.text_area(
+                            "Variables (one per line)",
+                            value="\n".join(s["abstract_structure"]["variables"]),
+                            height=110,
+                        )
+                        edges_json = st.text_area(
+                            "Edges (JSON list)",
+                            value=json.dumps(s["abstract_structure"]["edges"], indent=2),
+                            height=150,
+                        )
+                        st.markdown("#### Reviewer Notes")
+                        notes = st.text_area(
+                            "Notes",
+                            value=s.get("reviewer_notes", ""),
+                            height=110,
+                        )
 
-                        # Sync to backend / MinIO
-                        try:
-                            api_update_extract_result(active_id, updated)
-                            st.success("Edits saved and synced to MinIO.")
-                        except Exception as exc:
-                            st.success("Edits saved locally.")
-                            st.warning(f"Backend sync failed: {exc}")
+                    save = st.form_submit_button(
+                        "💾 Save edits",
+                        use_container_width=True,
+                        type="primary",
+                    )
+
+                if save:
+                    try:
+                        edges_parsed = json.loads(edges_json)
+                    except Exception:
+                        edges_parsed = s["abstract_structure"]["edges"]
+                        st.warning("Could not parse edges JSON — kept previous value.")
+
+                    updated: dict = {
+                        "paper_id": active_id,
+                        "title": s.get("title", ""),
+                        "problem": {"background": bg, "problem": prob},
+                        "hypothesis": {"statement": hyp_stmt, "rationale": hyp_rat},
+                        "methodology": {
+                            "approach": approach,
+                            "techniques": [
+                                t.strip() for t in techniques.splitlines() if t.strip()
+                            ],
+                        },
+                        "constraints": {
+                            "assumptions": [
+                                a.strip() for a in assumptions.splitlines() if a.strip()
+                            ],
+                            "limitations": [
+                                l.strip() for l in limitations.splitlines() if l.strip()
+                            ],
+                        },
+                        "abstract_structure": {
+                            "variables": [
+                                v.strip() for v in variables.splitlines() if v.strip()
+                            ],
+                            "edges": edges_parsed,
+                        },
+                        "review_status": s.get("review_status", "pending"),
+                        "reviewer_notes": notes,
+                    }
+                    st.session_state.structures[active_id] = updated
+
+                    # Sync to backend / MinIO
+                    try:
+                        api_update_extract_result(active_id, updated)
+                        st.success("Edits saved and synced to MinIO.")
+                    except Exception as exc:
+                        st.success("Edits saved locally.")
+                        st.warning(f"Backend sync failed: {exc}")
