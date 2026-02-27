@@ -2,12 +2,14 @@
 
 Endpoints
 ---------
-GET  /api/search        Search arXiv for papers.
-POST /api/fetch         Download a paper PDF and store it in MinIO.
-POST /api/extract       Extract paper structure from a stored PDF using LLM.
-GET  /api/presigned-url Return a browser-accessible pre-signed URL for a stored PDF.
-GET  /api/papers        List all stored paper object names.
-GET  /healthz           Health check.
+GET  /api/search                        Search arXiv for papers.
+POST /api/fetch                         Download a paper PDF and store it in MinIO.
+POST /api/extract                       Extract paper structure from a stored PDF using LLM.
+GET  /api/extract-result/{arxiv_id}     Fetch a previously extracted paper structure from MinIO.
+PUT  /api/extract-result/{arxiv_id}     Update an extracted paper structure in MinIO.
+GET  /api/presigned-url                 Return a browser-accessible pre-signed URL for a stored PDF.
+GET  /api/papers                        List all stored paper object names.
+GET  /healthz                           Health check.
 """
 
 from __future__ import annotations
@@ -221,3 +223,43 @@ def list_papers(
     except Exception as exc:
         logger.exception("Listing objects failed")
         raise HTTPException(status_code=500, detail=f"List failed: {exc}") from exc
+
+
+@app.get("/api/extract-result/{arxiv_id}", response_model=PaperStructure)
+def get_extract_result(arxiv_id: str) -> PaperStructure:
+    """Fetch a previously extracted paper structure from the extracted-structures bucket."""
+    safe_id = arxiv_id.replace("/", "_")
+    try:
+        response = _storage().client.get_object("extracted-structures", f"{safe_id}.json")
+        data = response.read()
+        response.close()
+        response.release_conn()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=404, detail=f"No extraction found for '{arxiv_id}'"
+        ) from exc
+    try:
+        return PaperStructure.model_validate_json(data)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to parse stored structure: {exc}"
+        ) from exc
+
+
+@app.put("/api/extract-result/{arxiv_id}", response_model=PaperStructure)
+def update_extract_result(arxiv_id: str, body: PaperStructure) -> PaperStructure:
+    """Persist an updated paper structure to the extracted-structures bucket."""
+    safe_id = arxiv_id.replace("/", "_")
+    try:
+        json_bytes = body.model_dump_json().encode()
+        _storage().client.put_object(
+            "extracted-structures",
+            f"{safe_id}.json",
+            io.BytesIO(json_bytes),
+            length=len(json_bytes),
+            content_type="application/json",
+        )
+    except Exception as exc:
+        logger.exception("Failed to update extract result in MinIO")
+        raise HTTPException(status_code=500, detail=f"Update failed: {exc}") from exc
+    return body
