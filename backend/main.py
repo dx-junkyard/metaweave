@@ -4,6 +4,7 @@ Endpoints
 ---------
 GET  /api/search        Search arXiv for papers.
 POST /api/fetch         Download a paper PDF and store it in MinIO.
+POST /api/extract       Extract paper structure from a stored PDF using LLM.
 GET  /api/presigned-url Return a browser-accessible pre-signed URL for a stored PDF.
 GET  /api/papers        List all stored paper object names.
 GET  /healthz           Health check.
@@ -11,6 +12,7 @@ GET  /healthz           Health check.
 
 from __future__ import annotations
 
+import io
 import logging
 from functools import lru_cache
 
@@ -18,7 +20,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from metaweave import extractor as ext
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
+from metaweave.schema import PaperStructure
 from metaweave.storage import StorageManager
 
 logging.basicConfig(level=logging.INFO)
@@ -77,6 +81,11 @@ class FetchResponse(BaseModel):
 
 class PresignedUrlResponse(BaseModel):
     url: str
+
+
+class ExtractRequest(BaseModel):
+    object_name: str
+    arxiv_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +148,52 @@ def fetch(body: FetchRequest) -> FetchResponse:
         raise HTTPException(status_code=502, detail=f"Fetch failed: {exc}") from exc
 
     return FetchResponse(object_name=object_name)
+
+
+@app.post("/api/extract", response_model=PaperStructure)
+def extract(body: ExtractRequest) -> PaperStructure:
+    """Extract paper structure from a stored PDF using the configured LLM.
+
+    1. Fetch the PDF bytes from MinIO (raw-papers bucket).
+    2. Extract plain text with PyMuPDF.
+    3. Call the OpenAI Structured Outputs API to obtain a PaperStructure.
+    4. Persist the result as JSON in the extracted-structures bucket.
+    """
+    # 1. Fetch PDF from MinIO
+    try:
+        response = _storage().client.get_object("raw-papers", body.object_name)
+        pdf_bytes = response.read()
+        response.close()
+        response.release_conn()
+    except Exception as exc:
+        logger.exception("Failed to fetch PDF from MinIO")
+        raise HTTPException(status_code=502, detail=f"MinIO fetch failed: {exc}") from exc
+
+    # 2 & 3. Extract text then structure
+    try:
+        text = ext.extract_text_from_pdf_bytes(pdf_bytes)
+        structure = ext.extract_paper_structure(text, paper_id=body.arxiv_id)
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Structure extraction failed")
+        raise HTTPException(status_code=502, detail=f"Extraction failed: {exc}") from exc
+
+    # 4. Persist JSON to extracted-structures bucket (best-effort)
+    try:
+        json_bytes = structure.model_dump_json().encode()
+        safe_id = body.arxiv_id.replace("/", "_")
+        _storage().client.put_object(
+            "extracted-structures",
+            f"{safe_id}.json",
+            io.BytesIO(json_bytes),
+            length=len(json_bytes),
+            content_type="application/json",
+        )
+    except Exception:
+        logger.warning("Could not persist extracted structure to MinIO", exc_info=True)
+
+    return structure
 
 
 @app.get("/api/presigned-url", response_model=PresignedUrlResponse)
