@@ -66,15 +66,15 @@ services:
       - path: .env
         required: false
     environment:
-      # Internal MinIO endpoint (resolved via Docker DNS).
-      # docker-compose の environment は env_file より優先されるため、
-      # MinIO 設定はここで上書きして確実に Docker DNS 名を使う。
-      MINIO_ENDPOINT: minio:9000
+      # host-gateway により、コンテナ内の localhost が Docker ホストを指す。
+      # MinIO は 9000 番でホストに公開されているため、バックエンドは
+      # localhost:9000 で MinIO に到達できる。ブラウザも同じ localhost:9000 を
+      # 使うため、署名に使うホスト名が統一され SignatureDoesNotMatch が起きない。
+      MINIO_ENDPOINT: localhost:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
-      # Public endpoint rewrite: browsers on the host cannot resolve "minio",
-      # so pre-signed URLs are rewritten to use localhost:9000 instead.
-      MINIO_PUBLIC_ENDPOINT: localhost:9000
+    extra_hosts:
+      - "localhost:host-gateway"   # コンテナ内 localhost → Docker ホスト
     depends_on:
       minio:
         condition: service_healthy

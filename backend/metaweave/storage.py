@@ -16,20 +16,20 @@ class StorageManager:
 
     Environment variables
     ---------------------
-    MINIO_ENDPOINT        Internal endpoint used for API calls (default: localhost:9000).
-    MINIO_ACCESS_KEY      MinIO access key (default: minioadmin).
-    MINIO_SECRET_KEY      MinIO secret key (default: minioadmin).
-    MINIO_PUBLIC_ENDPOINT Public-facing endpoint injected into pre-signed URLs so that
-                          browsers (outside Docker) can resolve the URL.
-                          Example: localhost:9000
-                          If unset, the internal endpoint is used as-is.
+    MINIO_ENDPOINT   Endpoint for all MinIO operations (default: localhost:9000).
+                     With ``extra_hosts: localhost:host-gateway`` in docker-compose,
+                     this resolves to the Docker host inside the container, which is
+                     the same address the browser uses — so pre-signed URL signatures
+                     are always valid without any hostname rewriting.
+    MINIO_ACCESS_KEY MinIO access key (default: minioadmin).
+    MINIO_SECRET_KEY MinIO secret key (default: minioadmin).
     """
 
     def __init__(self) -> None:
         endpoint = os.environ.get("MINIO_ENDPOINT", "localhost:9000")
         access_key = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
         secret_key = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
-        self._public_endpoint: str = os.environ.get("MINIO_PUBLIC_ENDPOINT", endpoint)
+        self._public_endpoint = os.environ.get("MINIO_PUBLIC_ENDPOINT", "localhost:9000")
 
         self.client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=False)
         self._ensure_buckets()
@@ -60,28 +60,31 @@ class StorageManager:
         return object_name
 
     # ------------------------------------------------------------------
-    # Pre-signed URL (with public-endpoint rewrite)
+    # Pre-signed URL
     # ------------------------------------------------------------------
-
     def presigned_url(
         self,
         bucket: str,
         object_name: str,
         expires: timedelta = timedelta(hours=1),
     ) -> str:
-        """Return a pre-signed GET URL, rewriting the host to the public endpoint.
-
-        MinIO generates URLs whose host matches the endpoint used to initialise
-        the client (e.g. ``minio:9000``).  Browsers running on the developer's
-        machine cannot resolve that hostname.  We therefore string-replace the
-        internal host with the value of ``MINIO_PUBLIC_ENDPOINT``.
-        """
-        url: str = self.client.presigned_get_object(bucket, object_name, expires=expires)
-        # Replace internal hostname with the public one if they differ.
-        internal = self.client._base_url._url.netloc  # type: ignore[attr-defined]
-        if internal != self._public_endpoint:
-            url = url.replace(f"//{internal}/", f"//{self._public_endpoint}/", 1)
+        # MinIOに対して、署名計算時に使用する Host ヘッダーを強制する。
+        # こうすることで、ブラウザから 'localhost:9000' でアクセスしても署名エラーにならない。
+        url = self.client.presigned_get_object(
+            bucket, 
+            object_name, 
+            expires=expires,
+            # ここが最重要ポイント
+            extra_query_params={"host": self._public_endpoint} 
+        )
+        
+        # 最後に、URLのドメイン部分を minio:9000 から localhost:9000 に置換する
+        internal_endpoint = os.environ.get("MINIO_ENDPOINT", "minio:9000")
+        if internal_endpoint != self._public_endpoint:
+             url = url.replace(internal_endpoint, self._public_endpoint, 1)
+             
         return url
+
 
     # ------------------------------------------------------------------
     # Listing
