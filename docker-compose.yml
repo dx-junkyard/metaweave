@@ -60,8 +60,15 @@ services:
       context: ./backend
     ports:
       - "8000:8000"
+    env_file:
+      # .env からシークレット（OPENAI_API_KEY 等）を読み込む。
+      # ファイルが存在しない場合は docker compose が警告を出す。
+      - path: .env
+        required: false
     environment:
       # Internal MinIO endpoint (resolved via Docker DNS).
+      # docker-compose の environment は env_file より優先されるため、
+      # MinIO 設定はここで上書きして確実に Docker DNS 名を使う。
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
