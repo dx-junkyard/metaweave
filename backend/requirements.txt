@@ -1,0 +1,9 @@
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+minio>=7.2,<8
+pydantic>=2.5,<3
+requests>=2.31,<3
+xmltodict>=0.13,<1
+openai>=1.30,<2
+python-dotenv>=1.0,<2
+pymupdf>=1.23,<2
