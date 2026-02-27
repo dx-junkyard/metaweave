@@ -68,6 +68,32 @@ def api_list_papers() -> list[str]:
     resp.raise_for_status()
     return resp.json()
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _empty_structure(paper_id: str) -> dict:
+    return {
+        "paper_id": paper_id,
+        "problem": {"background": "", "problem": ""},
+        "hypothesis": {"statement": "", "rationale": ""},
+        "methodology": {"approach": "", "techniques": []},
+        "constraints": {"assumptions": [], "limitations": []},
+        "abstract_structure": {
+            "variables": ["Variable_A", "Variable_B"],
+            "edges": [{"source": "Variable_A", "target": "Variable_B", "relation": "causes"}],
+        },
+        "review_status": "pending",
+        "reviewer_notes": "",
+    }
+
+
+def _mock_structure(meta: dict) -> dict:
+    s = _empty_structure(meta["arxiv_id"])
+    s["problem"]["background"] = "(Auto-extracted from abstract) " + meta.get("summary", "")[:200]
+    s["problem"]["problem"] = "To be extracted by LLM."
+    s["hypothesis"]["statement"] = "To be extracted by LLM."
+    return s
 
 # ---------------------------------------------------------------------------
 # Sidebar navigation
@@ -267,29 +293,3 @@ elif page == "Validation View":
             st.caption(f"Current status: **{s.get('review_status', 'pending')}**")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _empty_structure(paper_id: str) -> dict:
-    return {
-        "paper_id": paper_id,
-        "problem": {"background": "", "problem": ""},
-        "hypothesis": {"statement": "", "rationale": ""},
-        "methodology": {"approach": "", "techniques": []},
-        "constraints": {"assumptions": [], "limitations": []},
-        "abstract_structure": {
-            "variables": ["Variable_A", "Variable_B"],
-            "edges": [{"source": "Variable_A", "target": "Variable_B", "relation": "causes"}],
-        },
-        "review_status": "pending",
-        "reviewer_notes": "",
-    }
-
-
-def _mock_structure(meta: dict) -> dict:
-    s = _empty_structure(meta["arxiv_id"])
-    s["problem"]["background"] = "(Auto-extracted from abstract) " + meta.get("summary", "")[:200]
-    s["problem"]["problem"] = "To be extracted by LLM."
-    s["hypothesis"]["statement"] = "To be extracted by LLM."
-    return s
