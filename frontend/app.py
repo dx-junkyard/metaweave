@@ -68,6 +68,21 @@ def api_list_papers() -> list[str]:
     resp.raise_for_status()
     return resp.json()
 
+
+def api_extract(object_name: str, arxiv_id: str) -> dict:
+    """POST /api/extract and return the extracted PaperStructure as a dict.
+
+    Reasoning モデルは応答に数十秒〜数分かかる場合があるため timeout を長めに設定。
+    """
+    resp = requests.post(
+        f"{BACKEND_URL}/api/extract",
+        json={"object_name": object_name, "arxiv_id": arxiv_id},
+        timeout=300,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -80,20 +95,12 @@ def _empty_structure(paper_id: str) -> dict:
         "methodology": {"approach": "", "techniques": []},
         "constraints": {"assumptions": [], "limitations": []},
         "abstract_structure": {
-            "variables": ["Variable_A", "Variable_B"],
-            "edges": [{"source": "Variable_A", "target": "Variable_B", "relation": "causes"}],
+            "variables": [],
+            "edges": [],
         },
         "review_status": "pending",
         "reviewer_notes": "",
     }
-
-
-def _mock_structure(meta: dict) -> dict:
-    s = _empty_structure(meta["arxiv_id"])
-    s["problem"]["background"] = "(Auto-extracted from abstract) " + meta.get("summary", "")[:200]
-    s["problem"]["problem"] = "To be extracted by LLM."
-    s["hypothesis"]["statement"] = "To be extracted by LLM."
-    return s
 
 # ---------------------------------------------------------------------------
 # Sidebar navigation
@@ -144,14 +151,19 @@ if page == "Harvester Dashboard":
                         st.success(f"Stored: {stored}")
                 with cols[2]:
                     if st.button("Fetch & Store", key=f"fetch_{idx}"):
-                        with st.spinner("Downloading & storing PDF …"):
-                            try:
+                        arxiv_id = meta["arxiv_id"]
+                        try:
+                            with st.spinner("Downloading & storing PDF …"):
                                 object_name = api_fetch(meta)
-                                st.session_state.stored_papers[meta["arxiv_id"]] = object_name
-                                st.session_state.structures[meta["arxiv_id"]] = _mock_structure(meta)
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(f"Failed: {exc}")
+                                st.session_state.stored_papers[arxiv_id] = object_name
+                            with st.spinner(
+                                "Extracting structure using LLM (this may take a minute) …"
+                            ):
+                                structure = api_extract(object_name, arxiv_id)
+                                st.session_state.structures[arxiv_id] = structure
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Failed: {exc}")
                 st.divider()
 
 # =========================================================================
