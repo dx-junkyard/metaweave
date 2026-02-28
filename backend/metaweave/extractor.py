@@ -30,7 +30,7 @@ from typing import Any
 import fitz  # PyMuPDF
 
 from metaweave.llm import get_client, get_settings
-from metaweave.schema import PaperStructure
+from metaweave.schema import MergeResult, PaperStructure
 
 logger = logging.getLogger(__name__)
 
@@ -313,3 +313,70 @@ def extract_paper_structure(text: str, paper_id: str = "") -> PaperStructure:
         executor.shutdown(wait=False)
 
     return structure
+
+
+# ---------------------------------------------------------------------------
+# Public: LLM提案評価・マージ関数 (Gateway層)
+# ---------------------------------------------------------------------------
+
+def evaluate_and_merge_proposals(
+    base_structure: PaperStructure,
+    proposed_structure: PaperStructure,
+) -> MergeResult:
+    """Reasoningモデルを使って正典構造とユーザー提案をマージ・評価する。
+
+    方針: 「ジャンクの中の宝石」を最大限に拾い上げる。
+    粗削りな提案であっても有用な洞察・補足・修正を積極的に取り込み、
+    正典構造をより良いものに育てる。
+
+    Parameters
+    ----------
+    base_structure:
+        現在の正典 PaperStructure（マージのベースライン）。
+    proposed_structure:
+        ユーザーが提出した提案 PaperStructure。
+
+    Returns
+    -------
+    MergeResult
+        ``merged_structure`` (更新後の正典) と
+        ``evaluation_reasoning`` (マージ方針・却下理由のテキスト) を含む。
+
+    Notes on Reasoning models
+    -------------------------
+    gpt-5.2 等の Reasoning モデルは ``system`` ロールをサポートしないため、
+    すべてのプロンプトを ``user`` ロールで送信する。
+    temperature 等のパラメータも指定しない。
+    """
+    client = get_client()
+    settings = get_settings()
+
+    prompt = (
+        "あなたは論文構造レビュアーです。\n"
+        "以下に「現在の正典構造 (base)」と「ユーザー提案構造 (proposed)」を示します。\n\n"
+        "【マージ方針】\n"
+        "提案はジャンクを含む可能性がありますが、その中にある「宝石」（有用な洞察・"
+        "補足・修正・新しい視点）を最大限に拾い上げてください。\n"
+        "たとえ粗削りな提案であっても、正典構造をより正確・豊かにする部分があれば"
+        "積極的に取り込んでください。\n"
+        "一方、誤り・無関係・冗長な部分は正典から除外し、その理由を明記してください。\n\n"
+        f"--- base_structure ---\n{base_structure.model_dump_json(indent=2)}\n\n"
+        f"--- proposed_structure ---\n{proposed_structure.model_dump_json(indent=2)}\n\n"
+        "上記をマージした最終構造 (merged_structure) と、"
+        "マージした理由・却下した部分の理由 (evaluation_reasoning) を出力してください。\n"
+        f"merged_structure の paper_id は \"{base_structure.paper_id}\" を引き継いでください。"
+    )
+
+    resp = client.beta.chat.completions.parse(
+        model=settings.analysis_model,
+        messages=[{"role": "user", "content": prompt}],
+        response_format=MergeResult,
+    )
+    result: MergeResult = resp.choices[0].message.parsed
+    # paper_id は正典のものを必ず引き継ぐ
+    return MergeResult(
+        merged_structure=result.merged_structure.model_copy(
+            update={"paper_id": base_structure.paper_id}
+        ),
+        evaluation_reasoning=result.evaluation_reasoning,
+    )

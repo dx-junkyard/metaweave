@@ -10,6 +10,7 @@ GET  /api/extract-result/{arxiv_id}     Fetch a previously extracted paper struc
 PUT  /api/extract-result/{arxiv_id}     Update an extracted paper structure in MinIO.
 GET  /api/presigned-url                 Return a browser-accessible pre-signed URL for a stored PDF.
 GET  /api/papers                        List all stored paper object names.
+POST /api/propose-structure             Submit a user structure proposal (saved to Neo4j, async LLM review).
 GET  /healthz                           Health check.
 """
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 import io
 import logging
 import threading
+import uuid
 from functools import lru_cache
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
@@ -26,8 +28,9 @@ from pydantic import BaseModel
 
 from metaweave import extractor as ext
 from metaweave.chat import generate_chat_response
+from metaweave.db import get_driver
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
-from metaweave.schema import PaperStructure
+from metaweave.schema import PaperStructure, StructureProposal
 from metaweave.storage import StorageManager
 
 logging.basicConfig(level=logging.INFO)
@@ -128,6 +131,21 @@ class ChatResponse(BaseModel):
     """Response from the RAG chat endpoint."""
 
     answer: str
+
+
+class ProposeStructureRequest(BaseModel):
+    """Request body for POST /api/propose-structure."""
+
+    arxiv_id: str
+    user_id: str
+    proposed_structure: PaperStructure
+
+
+class ProposeStructureResponse(BaseModel):
+    """Immediate response for an accepted structure proposal."""
+
+    proposal_id: str
+    status: str = "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -369,3 +387,120 @@ def chat(body: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=500, detail=f"Chat failed: {exc}") from exc
 
     return ChatResponse(answer=answer)
+
+
+# ---------------------------------------------------------------------------
+# Background LLM review task
+# ---------------------------------------------------------------------------
+
+def _run_review_task(proposal: StructureProposal) -> None:
+    """バックグラウンドで実行される LLM 提案レビュータスク。
+
+    1. MinIO から正典構造を取得（なければ提案構造を正典として扱う）
+    2. evaluate_and_merge_proposals でマージ評価
+    3. Neo4j の提案ノードに結果を書き戻す
+    """
+    driver = get_driver()
+
+    # 1. 正典構造を MinIO から取得
+    safe_id = proposal.arxiv_id.replace("/", "_")
+    try:
+        response = _storage().client.get_object("extracted-structures", f"{safe_id}.json")
+        data = response.read()
+        response.close()
+        response.release_conn()
+        base_structure = PaperStructure.model_validate_json(data)
+    except Exception:
+        logger.warning(
+            "Base structure not found for %s — using proposal as baseline",
+            proposal.arxiv_id,
+        )
+        base_structure = proposal.proposed_structure
+
+    # 2. LLM によるマージ評価
+    try:
+        merge_result = ext.evaluate_and_merge_proposals(base_structure, proposal.proposed_structure)
+        new_status = "approved"
+        reasoning = merge_result.evaluation_reasoning
+        merged_json = merge_result.merged_structure.model_dump_json()
+    except Exception:
+        logger.exception("LLM review failed for proposal %s", proposal.proposal_id)
+        new_status = "failed"
+        reasoning = "LLM review encountered an error."
+        merged_json = ""
+
+    # 3. Neo4j の提案ノードを更新
+    with driver.session() as session:
+        session.run(
+            """
+            MATCH (p:StructureProposal {proposal_id: $proposal_id})
+            SET p.status = $status,
+                p.evaluation_reasoning = $reasoning,
+                p.merged_structure = $merged_json
+            """,
+            proposal_id=proposal.proposal_id,
+            status=new_status,
+            reasoning=reasoning,
+            merged_json=merged_json,
+        )
+    logger.info(
+        "Review task completed for proposal %s — status=%s",
+        proposal.proposal_id,
+        new_status,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Proposal endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/api/propose-structure", response_model=ProposeStructureResponse)
+def propose_structure(
+    body: ProposeStructureRequest, background_tasks: BackgroundTasks
+) -> ProposeStructureResponse:
+    """ユーザーの構造提案を受け付け、Neo4j に保存してバックグラウンドでレビューをトリガーする。
+
+    処理フロー:
+    1. 新しい proposal_id を生成
+    2. Neo4j に User ノードと StructureProposal ノードを MERGE/CREATE
+    3. BackgroundTasks に LLM レビュータスクを追加
+    4. {proposal_id, status: "pending"} を即時返却
+    """
+    proposal_id = str(uuid.uuid4())
+    proposal = StructureProposal(
+        proposal_id=proposal_id,
+        arxiv_id=body.arxiv_id,
+        user_id=body.user_id,
+        proposed_structure=body.proposed_structure,
+    )
+
+    # Neo4j への保存
+    try:
+        driver = get_driver()
+        with driver.session() as session:
+            session.run(
+                """
+                MERGE (u:User {id: $user_id})
+                CREATE (p:StructureProposal {
+                    proposal_id:        $proposal_id,
+                    arxiv_id:           $arxiv_id,
+                    user_id:            $user_id,
+                    proposed_structure: $proposed_structure,
+                    status:             'pending'
+                })
+                CREATE (u)-[:PROPOSED]->(p)
+                """,
+                user_id=body.user_id,
+                proposal_id=proposal_id,
+                arxiv_id=body.arxiv_id,
+                proposed_structure=body.proposed_structure.model_dump_json(),
+            )
+    except Exception as exc:
+        logger.exception("Failed to save proposal %s to Neo4j", proposal_id)
+        raise HTTPException(status_code=500, detail=f"Failed to save proposal: {exc}") from exc
+
+    # バックグラウンドで LLM レビューをトリガー
+    background_tasks.add_task(_run_review_task, proposal)
+    logger.info("Proposal %s queued for LLM review (arxiv_id=%s)", proposal_id, body.arxiv_id)
+
+    return ProposeStructureResponse(proposal_id=proposal_id, status="pending")

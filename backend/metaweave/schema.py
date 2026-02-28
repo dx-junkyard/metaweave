@@ -69,3 +69,38 @@ class PaperStructure(BaseModel):
     abstract_structure: AbstractStructure = Field(default_factory=AbstractStructure)
     review_status: ReviewStatus = Field(default=ReviewStatus.PENDING)
     reviewer_notes: str = Field(default="")
+
+
+# ---------------------------------------------------------------------------
+# Auth & proposal schemas (Private layer)
+# ---------------------------------------------------------------------------
+
+class User(BaseModel):
+    """A registered user of MetaWeave."""
+
+    id: str = Field(description="Unique user identifier")
+    username: str = Field(description="Display name")
+    email: str = Field(description="Email address")
+
+
+class StructureProposal(BaseModel):
+    """A user-submitted proposal to modify a paper's canonical structure."""
+
+    proposal_id: str = Field(description="Unique identifier for this proposal")
+    arxiv_id: str = Field(description="arXiv paper identifier the proposal targets")
+    user_id: str = Field(description="ID of the proposing user")
+    proposed_structure: PaperStructure = Field(description="The proposed PaperStructure")
+    status: ReviewStatus = Field(default=ReviewStatus.PENDING, description="Review status of the proposal")
+
+
+# ---------------------------------------------------------------------------
+# LLM merge result schema (Gateway layer)
+# ---------------------------------------------------------------------------
+
+class MergeResult(BaseModel):
+    """Result of the LLM-driven proposal evaluation and merge."""
+
+    merged_structure: PaperStructure = Field(description="The merged canonical structure")
+    evaluation_reasoning: str = Field(
+        description="Explanation of what was merged, improved, or rejected and why"
+    )
