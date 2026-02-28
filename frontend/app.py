@@ -44,6 +44,9 @@ if "active_paper_id" not in st.session_state:
 # 処理中の論文: arxiv_id -> {"title": str, "object_name": str}
 if "processing_papers" not in st.session_state:
     st.session_state.processing_papers: dict[str, dict] = {}
+# チャット履歴: arxiv_id -> list of {"role": str, "content": str}
+if "chat_histories" not in st.session_state:
+    st.session_state.chat_histories: dict[str, list[dict]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +168,17 @@ def api_update_extract_result(arxiv_id: str, structure: dict) -> None:
         timeout=30,
     )
     resp.raise_for_status()
+
+
+def api_chat(arxiv_id: str, message: str, history: list[dict]) -> str:
+    """POST /api/chat — RAG-based chat response."""
+    resp = requests.post(
+        f"{BACKEND_URL}/api/chat",
+        json={"arxiv_id": arxiv_id, "message": message, "history": history},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()["answer"]
 
 
 # ---------------------------------------------------------------------------
@@ -456,134 +470,195 @@ elif page == "Validation View":
                 except Exception as exc:
                     st.error(f"Could not load PDF: {exc}")
 
-            # ── Structure Editor ─────────────────────────────────────────────
+            # ── Structure Editor + Chat ───────────────────────────────────────
             with edit_col:
-                st.markdown("**Extracted Structure**")
+                struct_tab, chat_tab = st.tabs(["📄 Extracted Structure", "💬 Chat"])
 
-                if is_processing:
+                # ── Structure Editor tab ──────────────────────────────────────
+                with struct_tab:
+                    if is_processing:
+                        st.markdown(
+                            "🔄 **解析処理中です。** 完了後に構造データが表示されます。"
+                        )
+
+                    with st.form(f"structure_form_{active_id}"):
+                        tab1, tab2, tab3 = st.tabs(
+                            ["Problem / Hypothesis", "Method / Constraints", "Abstract / Notes"]
+                        )
+
+                        with tab1:
+                            st.markdown("#### Problem Statement")
+                            bg = st.text_area(
+                                "Background",
+                                value=s["problem"]["background"],
+                                height=130,
+                            )
+                            prob = st.text_area(
+                                "Problem",
+                                value=s["problem"]["problem"],
+                                height=130,
+                            )
+                            st.markdown("#### Hypothesis")
+                            hyp_stmt = st.text_area(
+                                "Statement",
+                                value=s["hypothesis"]["statement"],
+                                height=110,
+                            )
+                            hyp_rat = st.text_area(
+                                "Rationale",
+                                value=s["hypothesis"]["rationale"],
+                                height=110,
+                            )
+
+                        with tab2:
+                            st.markdown("#### Methodology")
+                            approach = st.text_area(
+                                "Approach",
+                                value=s["methodology"]["approach"],
+                                height=130,
+                            )
+                            techniques = st.text_area(
+                                "Techniques (one per line)",
+                                value="\n".join(s["methodology"]["techniques"]),
+                                height=110,
+                            )
+                            st.markdown("#### Constraints")
+                            assumptions = st.text_area(
+                                "Assumptions (one per line)",
+                                value="\n".join(s["constraints"]["assumptions"]),
+                                height=110,
+                            )
+                            limitations = st.text_area(
+                                "Limitations (one per line)",
+                                value="\n".join(s["constraints"]["limitations"]),
+                                height=110,
+                            )
+
+                        with tab3:
+                            st.markdown("#### Abstract Structure")
+                            variables = st.text_area(
+                                "Variables (one per line)",
+                                value="\n".join(s["abstract_structure"]["variables"]),
+                                height=110,
+                            )
+                            edges_json = st.text_area(
+                                "Edges (JSON list)",
+                                value=json.dumps(s["abstract_structure"]["edges"], indent=2),
+                                height=150,
+                            )
+                            st.markdown("#### Reviewer Notes")
+                            notes = st.text_area(
+                                "Notes",
+                                value=s.get("reviewer_notes", ""),
+                                height=110,
+                            )
+
+                        save = st.form_submit_button(
+                            "💾 Save edits",
+                            use_container_width=True,
+                            type="primary",
+                        )
+
+                    if save:
+                        try:
+                            edges_parsed = json.loads(edges_json)
+                        except Exception:
+                            edges_parsed = s["abstract_structure"]["edges"]
+                            st.warning("Could not parse edges JSON — kept previous value.")
+
+                        updated: dict = {
+                            "paper_id": active_id,
+                            "title": s.get("title", ""),
+                            "problem": {"background": bg, "problem": prob},
+                            "hypothesis": {"statement": hyp_stmt, "rationale": hyp_rat},
+                            "methodology": {
+                                "approach": approach,
+                                "techniques": [
+                                    t.strip() for t in techniques.splitlines() if t.strip()
+                                ],
+                            },
+                            "constraints": {
+                                "assumptions": [
+                                    a.strip() for a in assumptions.splitlines() if a.strip()
+                                ],
+                                "limitations": [
+                                    l.strip() for l in limitations.splitlines() if l.strip()
+                                ],
+                            },
+                            "abstract_structure": {
+                                "variables": [
+                                    v.strip() for v in variables.splitlines() if v.strip()
+                                ],
+                                "edges": edges_parsed,
+                            },
+                            "review_status": s.get("review_status", "pending"),
+                            "reviewer_notes": notes,
+                        }
+                        st.session_state.structures[active_id] = updated
+
+                        # Sync to backend / MinIO
+                        try:
+                            api_update_extract_result(active_id, updated)
+                            st.success("Edits saved and synced to MinIO.")
+                        except Exception as exc:
+                            st.success("Edits saved locally.")
+                            st.warning(f"Backend sync failed: {exc}")
+
+                # ── Chat tab ──────────────────────────────────────────────────
+                with chat_tab:
                     st.markdown(
-                        "🔄 **解析処理中です。** 完了後に構造データが表示されます。"
+                        "論文の内容や解析結果についてAIに質問できます。"
+                        " 回答はQdrantのベクトル検索と抽出済み構造データを参照して生成されます。"
                     )
 
-                with st.form(f"structure_form_{active_id}"):
-                    tab1, tab2, tab3 = st.tabs(
-                        ["Problem / Hypothesis", "Method / Constraints", "Abstract / Notes"]
+                    # 論文ごとのチャット履歴を初期化
+                    if active_id not in st.session_state.chat_histories:
+                        st.session_state.chat_histories[active_id] = []
+
+                    chat_history = st.session_state.chat_histories[active_id]
+
+                    # 履歴をクリアするボタン
+                    if chat_history:
+                        if st.button("🗑️ Clear chat history", key=f"clear_chat_{active_id}"):
+                            st.session_state.chat_histories[active_id] = []
+                            st.rerun()
+
+                    # 過去のメッセージを表示
+                    for turn in chat_history:
+                        with st.chat_message(turn["role"]):
+                            st.markdown(turn["content"])
+
+                    # 入力欄
+                    user_input = st.chat_input(
+                        "論文について質問してください…",
+                        key=f"chat_input_{active_id}",
+                        disabled=is_processing,
                     )
 
-                    with tab1:
-                        st.markdown("#### Problem Statement")
-                        bg = st.text_area(
-                            "Background",
-                            value=s["problem"]["background"],
-                            height=130,
-                        )
-                        prob = st.text_area(
-                            "Problem",
-                            value=s["problem"]["problem"],
-                            height=130,
-                        )
-                        st.markdown("#### Hypothesis")
-                        hyp_stmt = st.text_area(
-                            "Statement",
-                            value=s["hypothesis"]["statement"],
-                            height=110,
-                        )
-                        hyp_rat = st.text_area(
-                            "Rationale",
-                            value=s["hypothesis"]["rationale"],
-                            height=110,
-                        )
+                    if is_processing:
+                        st.info("解析処理完了後にチャットを利用できます。")
+                    elif user_input:
+                        # ユーザーメッセージを即座に表示
+                        with st.chat_message("user"):
+                            st.markdown(user_input)
 
-                    with tab2:
-                        st.markdown("#### Methodology")
-                        approach = st.text_area(
-                            "Approach",
-                            value=s["methodology"]["approach"],
-                            height=130,
-                        )
-                        techniques = st.text_area(
-                            "Techniques (one per line)",
-                            value="\n".join(s["methodology"]["techniques"]),
-                            height=110,
-                        )
-                        st.markdown("#### Constraints")
-                        assumptions = st.text_area(
-                            "Assumptions (one per line)",
-                            value="\n".join(s["constraints"]["assumptions"]),
-                            height=110,
-                        )
-                        limitations = st.text_area(
-                            "Limitations (one per line)",
-                            value="\n".join(s["constraints"]["limitations"]),
-                            height=110,
-                        )
-
-                    with tab3:
-                        st.markdown("#### Abstract Structure")
-                        variables = st.text_area(
-                            "Variables (one per line)",
-                            value="\n".join(s["abstract_structure"]["variables"]),
-                            height=110,
-                        )
-                        edges_json = st.text_area(
-                            "Edges (JSON list)",
-                            value=json.dumps(s["abstract_structure"]["edges"], indent=2),
-                            height=150,
-                        )
-                        st.markdown("#### Reviewer Notes")
-                        notes = st.text_area(
-                            "Notes",
-                            value=s.get("reviewer_notes", ""),
-                            height=110,
-                        )
-
-                    save = st.form_submit_button(
-                        "💾 Save edits",
-                        use_container_width=True,
-                        type="primary",
-                    )
-
-                if save:
-                    try:
-                        edges_parsed = json.loads(edges_json)
-                    except Exception:
-                        edges_parsed = s["abstract_structure"]["edges"]
-                        st.warning("Could not parse edges JSON — kept previous value.")
-
-                    updated: dict = {
-                        "paper_id": active_id,
-                        "title": s.get("title", ""),
-                        "problem": {"background": bg, "problem": prob},
-                        "hypothesis": {"statement": hyp_stmt, "rationale": hyp_rat},
-                        "methodology": {
-                            "approach": approach,
-                            "techniques": [
-                                t.strip() for t in techniques.splitlines() if t.strip()
-                            ],
-                        },
-                        "constraints": {
-                            "assumptions": [
-                                a.strip() for a in assumptions.splitlines() if a.strip()
-                            ],
-                            "limitations": [
-                                l.strip() for l in limitations.splitlines() if l.strip()
-                            ],
-                        },
-                        "abstract_structure": {
-                            "variables": [
-                                v.strip() for v in variables.splitlines() if v.strip()
-                            ],
-                            "edges": edges_parsed,
-                        },
-                        "review_status": s.get("review_status", "pending"),
-                        "reviewer_notes": notes,
-                    }
-                    st.session_state.structures[active_id] = updated
-
-                    # Sync to backend / MinIO
-                    try:
-                        api_update_extract_result(active_id, updated)
-                        st.success("Edits saved and synced to MinIO.")
-                    except Exception as exc:
-                        st.success("Edits saved locally.")
-                        st.warning(f"Backend sync failed: {exc}")
+                        # バックエンドを呼び出して回答を生成
+                        with st.chat_message("assistant"):
+                            with st.spinner("回答を生成中…"):
+                                try:
+                                    answer = api_chat(
+                                        arxiv_id=active_id,
+                                        message=user_input,
+                                        history=chat_history,
+                                    )
+                                    st.markdown(answer)
+                                    # 履歴に追加
+                                    st.session_state.chat_histories[active_id].append(
+                                        {"role": "user", "content": user_input}
+                                    )
+                                    st.session_state.chat_histories[active_id].append(
+                                        {"role": "assistant", "content": answer}
+                                    )
+                                except Exception as exc:
+                                    error_msg = f"チャットエラー: {exc}"
+                                    st.error(error_msg)
