@@ -76,17 +76,15 @@ def _poll_processing_papers() -> None:
             except Exception:
                 pass
             title = info.get("title", arxiv_id)
-            st.toast(f"✅ 「{title}」 の解析が完了しました", icon="✅")
             del st.session_state.processing_papers[arxiv_id]
+            st.toast(f"解析が完了しました！", icon="✅")
+            st.rerun()
 
         elif status == "failed":
             error_msg = status_data.get("error", "不明なエラー")
             title = info.get("title", arxiv_id)
-            st.toast(f"❌ 「{title}」 の解析に失敗しました: {error_msg}", icon="❌")
             del st.session_state.processing_papers[arxiv_id]
-
-
-_poll_processing_papers()
+            st.error(f"「{title}」 の解析に失敗しました: {error_msg}")
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +165,14 @@ def api_update_extract_result(arxiv_id: str, structure: dict) -> None:
         timeout=30,
     )
     resp.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
+# Polling: check status of in-flight jobs and fire toasts
+# (called here, after all API helpers are defined)
+# ---------------------------------------------------------------------------
+
+_poll_processing_papers()
 
 
 # ---------------------------------------------------------------------------
