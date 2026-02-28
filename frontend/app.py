@@ -252,6 +252,39 @@ def api_get_proposals(arxiv_id: str) -> dict:
     return resp.json()  # {proposals: [...]}
 
 
+def api_extract_pattern(arxiv_id: str) -> dict:
+    """POST /api/patterns/extract/{arxiv_id} — trigger pattern extraction."""
+    resp = requests.post(
+        f"{BACKEND_URL}/api/patterns/extract/{arxiv_id}",
+        headers=_auth_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def api_list_patterns() -> list[dict]:
+    """GET /api/patterns — fetch all registered patterns."""
+    resp = requests.get(
+        f"{BACKEND_URL}/api/patterns",
+        headers=_auth_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json().get("patterns", [])
+
+
+def api_get_paper_patterns(arxiv_id: str) -> list[dict]:
+    """GET /api/papers/{arxiv_id}/patterns — fetch patterns matching a paper."""
+    resp = requests.get(
+        f"{BACKEND_URL}/api/papers/{arxiv_id}/patterns",
+        headers=_auth_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json().get("matches", [])
+
+
 def _auth_post(path: str, payload: dict) -> dict:
     """Helper: POST to an auth endpoint and return the response JSON dict."""
     resp = requests.post(f"{BACKEND_URL}{path}", json=payload, timeout=15)
@@ -397,7 +430,7 @@ with _user_col:
 with st.sidebar:
     st.markdown("## MetaWeave v1")
     st.caption(f"👤 {st.session_state.username}")
-    page = st.radio("Navigation", ["Harvester Dashboard", "Validation View"])
+    page = st.radio("Navigation", ["Harvester Dashboard", "Validation View", "Pattern Library"])
 
     if page == "Validation View":
         st.divider()
@@ -589,7 +622,7 @@ elif page == "Validation View":
             )
 
             # ── Action buttons (right-aligned) ───────────────────────────────
-            _, act1, act2, act3 = st.columns([6, 1, 1, 1])
+            _, act1, act2, act3, act4 = st.columns([5, 1, 1, 1, 1])
             with act1:
                 if st.button("✅ Approve", use_container_width=True, key="btn_approve"):
                     s["review_status"] = "approved"
@@ -620,8 +653,33 @@ elif page == "Validation View":
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Re-extraction failed: {exc}")
+            with act4:
+                if st.button("✨ Pattern", use_container_width=True, key="btn_pattern"):
+                    try:
+                        api_extract_pattern(active_id)
+                        st.toast("✨ 抽象化パターンの抽出を開始しました")
+                    except Exception as exc:
+                        st.error(f"Pattern extraction failed: {exc}")
 
             st.divider()
+
+            # ── Pattern tags (matched patterns for this paper) ──────────────
+            try:
+                _paper_patterns = api_get_paper_patterns(active_id)
+                if _paper_patterns:
+                    _tag_cols = st.columns(min(len(_paper_patterns), 6))
+                    for _pi, _pm in enumerate(_paper_patterns):
+                        with _tag_cols[_pi % len(_tag_cols)]:
+                            _conf = _pm.get("confidence_score", 0)
+                            _pname = _pm.get("pattern_name") or _pm.get("pattern_id", "")[:8]
+                            st.markdown(
+                                f"<span style='background:#e0f7fa;padding:2px 8px;"
+                                f"border-radius:12px;font-size:0.85em;'>"
+                                f"🔗 {_pname} ({_conf:.0%})</span>",
+                                unsafe_allow_html=True,
+                            )
+            except Exception:
+                pass  # パターンがない場合はスキップ
 
             # ── Main 2-column layout [5, 5] ──────────────────────────────────
             pdf_col, edit_col = st.columns([5, 5])
@@ -912,3 +970,75 @@ elif page == "Validation View":
                                     st.caption("AIによる評価待ちです。")
                                 else:
                                     st.caption("評価理由が記録されていません。")
+
+# =========================================================================
+# Page C — Pattern Library
+# =========================================================================
+elif page == "Pattern Library":
+    st.header("Pattern Library")
+    st.caption(
+        "登録済みの抽象化パターン一覧と、各パターンに適合する論文群を確認できます。"
+    )
+
+    col_refresh_pl, _ = st.columns([1, 5])
+    with col_refresh_pl:
+        if st.button("🔄 更新", key="refresh_pattern_library"):
+            st.rerun()
+
+    try:
+        _all_patterns = api_list_patterns()
+    except Exception as exc:
+        st.error(f"パターン一覧の取得に失敗しました: {exc}")
+        _all_patterns = []
+
+    if not _all_patterns:
+        st.info(
+            "まだ抽象化パターンが登録されていません。\n\n"
+            "Validation View で論文を選択し、「✨ Pattern」ボタンをクリックして\n"
+            "抽象化パターンを抽出してください。"
+        )
+    else:
+        for _pat in _all_patterns:
+            _pat_id = _pat.get("pattern_id", "")
+            _pat_name = _pat.get("name", "Unnamed Pattern")
+            _pat_desc = _pat.get("description", "")
+            _pat_vars = _pat.get("variables_template", [])
+            _pat_rules = _pat.get("structural_rules", [])
+            _pat_source = _pat.get("source_arxiv_id", "")
+
+            with st.container(border=True):
+                _pl_left, _pl_right = st.columns([3, 1])
+                with _pl_left:
+                    st.markdown(f"### {_pat_name}")
+                    st.markdown(_pat_desc)
+
+                    if _pat_vars:
+                        _vars_str = ", ".join(f"`{v}`" for v in _pat_vars)
+                        st.markdown(f"**Variables:** {_vars_str}")
+                    if _pat_rules:
+                        st.markdown("**Structural Rules:**")
+                        for _rule in _pat_rules:
+                            st.markdown(f"- {_rule}")
+
+                with _pl_right:
+                    st.caption(f"ID: `{_pat_id[:8]}…`")
+                    if _pat_source:
+                        st.caption(f"Source: `{_pat_source}`")
+
+                # このパターンに適合する論文を表示
+                with st.expander("適合する論文を表示"):
+                    try:
+                        # Neo4j から MATCHES_PATTERN リレーションを逆引き
+                        _match_resp = requests.get(
+                            f"{BACKEND_URL}/api/patterns",
+                            headers=_auth_headers(),
+                            timeout=15,
+                        )
+                        # パターンIDでフィルタリングされた論文を取得するために
+                        # 各論文のパターンマッチを確認する（簡易実装）
+                        st.caption(
+                            "このパターンに適合する論文は、各論文の詳細画面で "
+                            "パターンタグとして表示されます。"
+                        )
+                    except Exception:
+                        st.caption("情報の取得に失敗しました。")

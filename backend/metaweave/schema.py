@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Optional
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -91,6 +92,58 @@ class StructureProposal(BaseModel):
     user_id: str = Field(description="ID of the proposing user")
     proposed_structure: PaperStructure = Field(description="The proposed PaperStructure")
     status: ReviewStatus = Field(default=ReviewStatus.PENDING, description="Review status of the proposal")
+
+
+# ---------------------------------------------------------------------------
+# LLM merge result schema (Gateway layer)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Abstraction Pattern schemas (Public layer)
+# ---------------------------------------------------------------------------
+
+class AbstractionPattern(BaseModel):
+    """A cross-domain problem-solving pattern extracted from a paper."""
+
+    pattern_id: str = Field(
+        default_factory=lambda: str(uuid4()),
+        description="Unique identifier for this pattern",
+    )
+    name: str = Field(description="Short, descriptive name of the pattern")
+    description: str = Field(description="Explanation of the pattern in general terms")
+    variables_template: list[str] = Field(
+        default_factory=list,
+        description="Abstract variables (X, Y, Z, …) used in the pattern",
+    )
+    structural_rules: list[str] = Field(
+        default_factory=list,
+        description="Rules describing how the variables interact (e.g. 'X inhibits Y')",
+    )
+    source_arxiv_id: str = Field(
+        default="",
+        description="arXiv ID of the paper from which this pattern was extracted",
+    )
+
+
+class PatternMatch(BaseModel):
+    """A record that a pattern matches (is isomorphic to) a target paper."""
+
+    match_id: str = Field(
+        default_factory=lambda: str(uuid4()),
+        description="Unique identifier for this match",
+    )
+    pattern_id: str = Field(description="ID of the AbstractionPattern")
+    target_arxiv_id: str = Field(description="arXiv ID of the matched paper")
+    mapping_explanation: str = Field(
+        default="",
+        description="Natural-language explanation of how the pattern maps to the paper",
+    )
+    confidence_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score of the match (0.0–1.0)",
+    )
 
 
 # ---------------------------------------------------------------------------
