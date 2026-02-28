@@ -47,6 +47,13 @@ if "processing_papers" not in st.session_state:
 # チャット履歴: arxiv_id -> list of {"role": str, "content": str}
 if "chat_histories" not in st.session_state:
     st.session_state.chat_histories: dict[str, list[dict]] = {}
+# Auth
+if "token" not in st.session_state:
+    st.session_state.token: str | None = None
+if "user_id" not in st.session_state:
+    st.session_state.user_id: str | None = None
+if "username" not in st.session_state:
+    st.session_state.username: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +188,85 @@ def api_chat(arxiv_id: str, message: str, history: list[dict]) -> str:
     return resp.json()["answer"]
 
 
+def _auth_post(path: str, payload: dict) -> dict:
+    """Helper: POST to an auth endpoint and return the response JSON dict."""
+    resp = requests.post(f"{BACKEND_URL}{path}", json=payload, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fetch_me(token: str) -> dict:
+    """GET /api/auth/me with a Bearer token."""
+    resp = requests.get(
+        f"{BACKEND_URL}/api/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _apply_auth(token: str) -> None:
+    """Populate session state from a freshly obtained JWT."""
+    me = _fetch_me(token)
+    st.session_state.token = token
+    st.session_state.user_id = me["id"]
+    st.session_state.username = me["username"]
+
+
+# ---------------------------------------------------------------------------
+# Login / Register page
+# ---------------------------------------------------------------------------
+
+def _show_auth_page() -> None:
+    """Render the full-screen login / register page and stop execution."""
+    _, center, _ = st.columns([1, 2, 1])
+    with center:
+        st.markdown("# MetaWeave v1")
+        st.markdown("---")
+        tab_login, tab_register = st.tabs(["Login", "Register"])
+
+        with tab_login:
+            with st.form("login_form"):
+                lg_user = st.text_input("Username")
+                lg_pass = st.text_input("Password", type="password")
+                lg_submit = st.form_submit_button(
+                    "Login", use_container_width=True, type="primary"
+                )
+            if lg_submit:
+                if lg_user and lg_pass:
+                    try:
+                        data = _auth_post("/api/auth/login", {"username": lg_user, "password": lg_pass})
+                        _apply_auth(data["access_token"])
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Login failed: {exc}")
+                else:
+                    st.warning("Please enter username and password.")
+
+        with tab_register:
+            with st.form("register_form"):
+                rg_user = st.text_input("Username", key="rg_user")
+                rg_email = st.text_input("Email", key="rg_email")
+                rg_pass = st.text_input("Password", type="password", key="rg_pass")
+                rg_submit = st.form_submit_button(
+                    "Register", use_container_width=True, type="primary"
+                )
+            if rg_submit:
+                if rg_user and rg_email and rg_pass:
+                    try:
+                        data = _auth_post(
+                            "/api/auth/register",
+                            {"username": rg_user, "email": rg_email, "password": rg_pass},
+                        )
+                        _apply_auth(data["access_token"])
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Registration failed: {exc}")
+                else:
+                    st.warning("Please fill in all fields.")
+
+
 # ---------------------------------------------------------------------------
 # Polling: check status of in-flight jobs and fire toasts
 # (called here, after all API helpers are defined)
@@ -223,11 +309,30 @@ _STATUS_LABEL: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
+# Auth gate — show login page and stop if not authenticated
+# ---------------------------------------------------------------------------
+
+if not st.session_state.token:
+    _show_auth_page()
+    st.stop()
+
+# Top-right user info + logout button
+_, _user_col = st.columns([6, 2])
+with _user_col:
+    st.caption(f"👤 **{st.session_state.username}**")
+    if st.button("Logout", key="btn_logout", use_container_width=True):
+        st.session_state.token = None
+        st.session_state.user_id = None
+        st.session_state.username = None
+        st.rerun()
+
+# ---------------------------------------------------------------------------
 # Sidebar — Navigation + Paper list (Validation View)
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
     st.markdown("## MetaWeave v1")
+    st.caption(f"👤 {st.session_state.username}")
     page = st.radio("Navigation", ["Harvester Dashboard", "Validation View"])
 
     if page == "Validation View":

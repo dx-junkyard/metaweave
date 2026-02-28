@@ -11,19 +11,27 @@ PUT  /api/extract-result/{arxiv_id}     Update an extracted paper structure in M
 GET  /api/presigned-url                 Return a browser-accessible pre-signed URL for a stored PDF.
 GET  /api/papers                        List all stored paper object names.
 POST /api/propose-structure             Submit a user structure proposal (saved to Neo4j, async LLM review).
+POST /api/auth/register                 Register a new user (Neo4j User node, returns JWT).
+POST /api/auth/login                    Authenticate and return a JWT.
+GET  /api/auth/me                       Return the current user's profile (requires Bearer token).
 GET  /healthz                           Health check.
 """
 
 from __future__ import annotations
 
+import datetime
 import io
 import logging
+import os
 import threading
 import uuid
 from functools import lru_cache
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+import jwt
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from passlib.context import CryptContext
 from pydantic import BaseModel
 
 from metaweave import extractor as ext
@@ -35,6 +43,17 @@ from metaweave.storage import StorageManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# JWT / password-hashing configuration
+# ---------------------------------------------------------------------------
+
+_JWT_SECRET: str = os.environ.get("JWT_SECRET", "metaweave-dev-secret-change-in-prod")
+_JWT_ALGORITHM: str = "HS256"
+_JWT_EXPIRE_HOURS: int = 24
+
+_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_bearer = HTTPBearer()
 
 app = FastAPI(title="MetaWeave API", version="0.2.0")
 
@@ -146,6 +165,65 @@ class ProposeStructureResponse(BaseModel):
 
     proposal_id: str
     status: str = "pending"
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserOut(BaseModel):
+    id: str
+    username: str
+    email: str
+
+
+# ---------------------------------------------------------------------------
+# Auth utility functions
+# ---------------------------------------------------------------------------
+
+def _hash_password(plain: str) -> str:
+    return _pwd_context.hash(plain)
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return _pwd_context.verify(plain, hashed)
+
+
+def _create_token(user_id: str, username: str, email: str) -> str:
+    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=_JWT_EXPIRE_HOURS)
+    payload = {"sub": user_id, "username": username, "email": email, "exp": expire}
+    return jwt.encode(payload, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
+
+
+def _get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer),
+) -> dict:
+    """FastAPI dependency: decode Bearer token and return user dict."""
+    try:
+        payload = jwt.decode(
+            credentials.credentials, _JWT_SECRET, algorithms=[_JWT_ALGORITHM]
+        )
+        return {
+            "id": payload["sub"],
+            "username": payload["username"],
+            "email": payload["email"],
+        }
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 
 # ---------------------------------------------------------------------------
@@ -504,3 +582,65 @@ def propose_structure(
     logger.info("Proposal %s queued for LLM review (arxiv_id=%s)", proposal_id, body.arxiv_id)
 
     return ProposeStructureResponse(proposal_id=proposal_id, status="pending")
+
+
+# ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/auth/register", response_model=TokenResponse, status_code=201)
+def auth_register(body: RegisterRequest) -> TokenResponse:
+    """新規ユーザーを Neo4j に登録し、JWT を返す。"""
+    driver = get_driver()
+    with driver.session() as session:
+        existing = session.run(
+            "MATCH (u:User {username: $username}) RETURN u.id AS id LIMIT 1",
+            username=body.username,
+        ).single()
+        if existing:
+            raise HTTPException(status_code=409, detail="Username already taken")
+
+        user_id = str(uuid.uuid4())
+        hashed_pw = _hash_password(body.password)
+        session.run(
+            """
+            CREATE (u:User {
+                id:              $id,
+                username:        $username,
+                email:           $email,
+                hashed_password: $hashed_password
+            })
+            """,
+            id=user_id,
+            username=body.username,
+            email=body.email,
+            hashed_password=hashed_pw,
+        )
+
+    logger.info("Registered new user '%s' (id=%s)", body.username, user_id)
+    return TokenResponse(access_token=_create_token(user_id, body.username, body.email))
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def auth_login(body: LoginRequest) -> TokenResponse:
+    """ユーザー名とパスワードを検証し、JWT を返す。"""
+    driver = get_driver()
+    with driver.session() as session:
+        record = session.run(
+            "MATCH (u:User {username: $username}) "
+            "RETURN u.id AS id, u.email AS email, u.hashed_password AS hashed_password",
+            username=body.username,
+        ).single()
+
+    if not record or not _verify_password(body.password, record["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    return TokenResponse(
+        access_token=_create_token(record["id"], body.username, record["email"])
+    )
+
+
+@app.get("/api/auth/me", response_model=UserOut)
+def auth_me(current_user: dict = Depends(_get_current_user)) -> UserOut:
+    """Bearer トークンからデコードした現在のユーザー情報を返す。"""
+    return UserOut(**current_user)
