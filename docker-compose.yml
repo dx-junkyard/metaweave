@@ -73,6 +73,9 @@ services:
       MINIO_ENDPOINT: localhost:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
+      # Qdrant は metaweave ネットワーク内でサービス名 "qdrant" で解決できる
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
     extra_hosts:
       - "localhost:host-gateway"   # コンテナ内 localhost → Docker ホスト
     depends_on:
