@@ -174,6 +174,23 @@ class ProposeStructureResponse(BaseModel):
     status: str = "pending"
 
 
+class ProposalItem(BaseModel):
+    """Single proposal entry returned by GET /api/proposals/{arxiv_id}."""
+
+    proposal_id: str
+    user_id: str
+    username: str | None = None
+    status: str
+    evaluation_reasoning: str | None = None
+    created_at: str | None = None
+
+
+class ProposalListResponse(BaseModel):
+    """List of proposals for a given paper."""
+
+    proposals: list[ProposalItem]
+
+
 class RegisterRequest(BaseModel):
     username: str
     email: str
@@ -571,7 +588,24 @@ def _run_review_task(proposal: StructureProposal) -> None:
         reasoning = "LLM review encountered an error."
         merged_json = ""
 
-    # 3. Neo4j の提案ノードを更新
+    # 3. 承認された場合、MinIO の正典構造を merged_structure で上書き更新
+    if new_status == "approved" and merged_json:
+        try:
+            merged_bytes = merged_json.encode()
+            _storage().client.put_object(
+                "extracted-structures",
+                f"{safe_id}.json",
+                io.BytesIO(merged_bytes),
+                length=len(merged_bytes),
+                content_type="application/json",
+            )
+            logger.info("Updated canonical structure in MinIO for %s", proposal.arxiv_id)
+        except Exception:
+            logger.exception(
+                "Failed to update MinIO with merged structure for %s", proposal.arxiv_id
+            )
+
+    # 4. Neo4j の提案ノードを更新
     with driver.session() as session:
         session.run(
             """
@@ -617,6 +651,7 @@ def propose_structure(
     )
 
     # Neo4j への保存
+    created_at = datetime.datetime.utcnow().isoformat()
     try:
         driver = get_driver()
         with driver.session() as session:
@@ -628,7 +663,8 @@ def propose_structure(
                     arxiv_id:           $arxiv_id,
                     user_id:            $user_id,
                     proposed_structure: $proposed_structure,
-                    status:             'pending'
+                    status:             'pending',
+                    created_at:         $created_at
                 })
                 CREATE (u)-[:PROPOSED]->(p)
                 """,
@@ -636,6 +672,7 @@ def propose_structure(
                 proposal_id=proposal_id,
                 arxiv_id=body.arxiv_id,
                 proposed_structure=body.proposed_structure.model_dump_json(),
+                created_at=created_at,
             )
     except Exception as exc:
         logger.exception("Failed to save proposal %s to Neo4j", proposal_id)
@@ -646,6 +683,46 @@ def propose_structure(
     logger.info("Proposal %s queued for LLM review (arxiv_id=%s)", proposal_id, body.arxiv_id)
 
     return ProposeStructureResponse(proposal_id=proposal_id, status="pending")
+
+
+@app.get("/api/proposals/{arxiv_id}", response_model=ProposalListResponse)
+def get_proposals(
+    arxiv_id: str,
+    current_user: dict = Depends(_get_current_user),
+) -> ProposalListResponse:
+    """指定論文に対する全提案履歴を Neo4j から取得して返す。
+
+    StructureProposal ノードを arxiv_id で絞り込み、提案者のユーザー名・ステータス・
+    LLM 評価理由などをリスト形式で返す。
+    """
+    driver = get_driver()
+    with driver.session() as session:
+        records = session.run(
+            """
+            MATCH (u:User)-[:PROPOSED]->(p:StructureProposal {arxiv_id: $arxiv_id})
+            RETURN p.proposal_id       AS proposal_id,
+                   p.user_id           AS user_id,
+                   u.username          AS username,
+                   p.status            AS status,
+                   p.evaluation_reasoning AS evaluation_reasoning,
+                   p.created_at        AS created_at
+            ORDER BY p.created_at DESC
+            """,
+            arxiv_id=arxiv_id,
+        ).data()
+
+    proposals = [
+        ProposalItem(
+            proposal_id=r["proposal_id"],
+            user_id=r["user_id"],
+            username=r.get("username"),
+            status=r["status"] or "pending",
+            evaluation_reasoning=r.get("evaluation_reasoning"),
+            created_at=r.get("created_at"),
+        )
+        for r in records
+    ]
+    return ProposalListResponse(proposals=proposals)
 
 
 # ---------------------------------------------------------------------------

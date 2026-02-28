@@ -54,6 +54,9 @@ if "user_id" not in st.session_state:
     st.session_state.user_id: str | None = None
 if "username" not in st.session_state:
     st.session_state.username: str | None = None
+# 提案中の論文: arxiv_id -> proposal_id (直近に送信した提案を追跡)
+if "pending_proposals" not in st.session_state:
+    st.session_state.pending_proposals: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +223,33 @@ def api_get_chat_history(arxiv_id: str) -> list[dict]:
         return []
     resp.raise_for_status()
     return resp.json().get("history", [])
+
+
+def api_propose_structure(arxiv_id: str, structure: dict) -> dict:
+    """POST /api/propose-structure — submit edited structure for LLM gateway review."""
+    resp = requests.post(
+        f"{BACKEND_URL}/api/propose-structure",
+        json={
+            "arxiv_id": arxiv_id,
+            "user_id": st.session_state.user_id,
+            "proposed_structure": structure,
+        },
+        headers=_auth_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()  # {proposal_id, status: "pending"}
+
+
+def api_get_proposals(arxiv_id: str) -> dict:
+    """GET /api/proposals/{arxiv_id} — fetch proposal history from Neo4j."""
+    resp = requests.get(
+        f"{BACKEND_URL}/api/proposals/{arxiv_id}",
+        headers=_auth_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()  # {proposals: [...]}
 
 
 def _auth_post(path: str, payload: dict) -> dict:
@@ -611,7 +641,9 @@ elif page == "Validation View":
 
             # ── Structure Editor + Chat ───────────────────────────────────────
             with edit_col:
-                struct_tab, chat_tab = st.tabs(["📄 Extracted Structure", "💬 Chat"])
+                struct_tab, chat_tab, proposals_tab = st.tabs(
+                    ["📄 Extracted Structure", "💬 Chat", "📋 提案履歴"]
+                )
 
                 # ── Structure Editor tab ──────────────────────────────────────
                 with struct_tab:
@@ -692,13 +724,13 @@ elif page == "Validation View":
                                 height=110,
                             )
 
-                        save = st.form_submit_button(
-                            "💾 Save edits",
+                        propose = st.form_submit_button(
+                            "💡 変更を提案する (Propose)",
                             use_container_width=True,
                             type="primary",
                         )
 
-                    if save:
+                    if propose:
                         try:
                             edges_parsed = json.loads(edges_json)
                         except Exception:
@@ -735,13 +767,17 @@ elif page == "Validation View":
                         }
                         st.session_state.structures[active_id] = updated
 
-                        # Sync to backend / MinIO
+                        # LLM Gateway へ提案を送信
                         try:
-                            api_update_extract_result(active_id, updated)
-                            st.success("Edits saved and synced to MinIO.")
+                            result = api_propose_structure(active_id, updated)
+                            proposal_id = result.get("proposal_id", "")
+                            st.session_state.pending_proposals[active_id] = proposal_id
+                            st.toast(
+                                "提案を送信しました。AIがレビュー・マージを行います",
+                                icon="💡",
+                            )
                         except Exception as exc:
-                            st.success("Edits saved locally.")
-                            st.warning(f"Backend sync failed: {exc}")
+                            st.error(f"提案の送信に失敗しました: {exc}")
 
                 # ── Chat tab ──────────────────────────────────────────────────
                 with chat_tab:
@@ -805,3 +841,74 @@ elif page == "Validation View":
                                 except Exception as exc:
                                     error_msg = f"チャットエラー: {exc}"
                                     st.error(error_msg)
+
+                # ── Proposals History tab ─────────────────────────────────────
+                with proposals_tab:
+                    st.markdown("### 提案履歴 (LLM Gateway)")
+                    st.caption(
+                        "「💡 変更を提案する」で送信した編集内容とAIの審査・マージ結果を確認できます。"
+                    )
+
+                    # 直近提案のペンディング状態インジケーター
+                    if active_id in st.session_state.pending_proposals:
+                        st.info(
+                            "⏳ **AIによるレビューが進行中です。** "
+                            "しばらく後にこのページを更新してください。",
+                            icon="⏳",
+                        )
+
+                    col_refresh, _ = st.columns([1, 4])
+                    with col_refresh:
+                        if st.button("🔄 更新", key=f"refresh_proposals_{active_id}"):
+                            st.rerun()
+
+                    try:
+                        proposals_data = api_get_proposals(active_id)
+                        proposals_list = proposals_data.get("proposals", [])
+                    except Exception as exc:
+                        st.error(f"提案履歴の取得に失敗しました: {exc}")
+                        proposals_list = []
+
+                    if not proposals_list:
+                        st.info("この論文に対する提案履歴はまだありません。")
+                    else:
+                        _PROPOSAL_STATUS_ICON = {
+                            "approved": "✅",
+                            "failed": "❌",
+                            "pending": "⏳",
+                        }
+                        for _p in proposals_list:
+                            _p_status = _p.get("status", "pending")
+                            _p_icon = _PROPOSAL_STATUS_ICON.get(_p_status, "🟡")
+                            _p_id_short = _p.get("proposal_id", "")[:8]
+                            _p_username = _p.get("username") or _p.get("user_id", "")
+                            _p_created = _p.get("created_at", "")
+
+                            # ペンディング解消チェック
+                            _tracked_id = st.session_state.pending_proposals.get(active_id)
+                            if (
+                                _tracked_id == _p.get("proposal_id")
+                                and _p_status in ("approved", "failed")
+                            ):
+                                st.session_state.pending_proposals.pop(active_id, None)
+
+                            with st.container(border=True):
+                                _head_col, _status_col = st.columns([3, 1])
+                                with _head_col:
+                                    st.markdown(
+                                        f"**提案 `{_p_id_short}…`**  |  👤 {_p_username}"
+                                    )
+                                    if _p_created:
+                                        st.caption(f"提出日時: {_p_created}")
+                                with _status_col:
+                                    st.markdown(f"## {_p_icon}")
+                                    st.caption(_p_status.upper())
+
+                                _reasoning = _p.get("evaluation_reasoning")
+                                if _reasoning:
+                                    with st.expander("AIの評価理由を見る"):
+                                        st.markdown(_reasoning)
+                                elif _p_status == "pending":
+                                    st.caption("AIによる評価待ちです。")
+                                else:
+                                    st.caption("評価理由が記録されていません。")
