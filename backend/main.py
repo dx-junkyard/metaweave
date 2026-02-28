@@ -4,7 +4,8 @@ Endpoints
 ---------
 GET  /api/search                        Search arXiv for papers.
 POST /api/fetch                         Download a paper PDF and store it in MinIO.
-POST /api/extract                       Extract paper structure from a stored PDF using LLM.
+POST /api/extract                       Submit async background extraction job.
+GET  /api/extract-status/{arxiv_id}     Poll extraction job status (pending/processing/completed/failed).
 GET  /api/extract-result/{arxiv_id}     Fetch a previously extracted paper structure from MinIO.
 PUT  /api/extract-result/{arxiv_id}     Update an extracted paper structure in MinIO.
 GET  /api/presigned-url                 Return a browser-accessible pre-signed URL for a stored PDF.
@@ -16,9 +17,10 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from functools import lru_cache
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -30,7 +32,7 @@ from metaweave.storage import StorageManager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="MetaWeave API", version="0.1.0")
+app = FastAPI(title="MetaWeave API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,6 +49,14 @@ app.add_middleware(
 @lru_cache(maxsize=1)
 def _storage() -> StorageManager:
     return StorageManager()
+
+
+# ---------------------------------------------------------------------------
+# In-memory extraction job status store
+# ---------------------------------------------------------------------------
+
+_job_lock = threading.Lock()
+_job_status: dict[str, "ExtractJobStatus"] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +98,72 @@ class PresignedUrlResponse(BaseModel):
 class ExtractRequest(BaseModel):
     object_name: str
     arxiv_id: str
+
+
+class ExtractAccepted(BaseModel):
+    """Immediate response for an accepted async extraction job."""
+
+    arxiv_id: str
+    status: str = "pending"
+
+
+class ExtractJobStatus(BaseModel):
+    """Current status of an async extraction job."""
+
+    arxiv_id: str
+    status: str  # pending | processing | completed | failed
+    error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Background extraction task
+# ---------------------------------------------------------------------------
+
+def _run_extraction_task(object_name: str, arxiv_id: str) -> None:
+    """バックグラウンドで実行される抽出タスク。
+
+    1. ステータスを "processing" に更新
+    2. MinIO から PDF を取得
+    3. テキスト抽出 → 仮説検証型チャンク解析 → Embedding（並行）
+    4. 結果を MinIO に保存
+    5. ステータスを "completed" または "failed" に更新
+    """
+    with _job_lock:
+        _job_status[arxiv_id] = ExtractJobStatus(arxiv_id=arxiv_id, status="processing")
+
+    try:
+        # 1. Fetch PDF from MinIO
+        logger.info("Background extraction started for %s", arxiv_id)
+        response = _storage().client.get_object("raw-papers", object_name)
+        pdf_bytes = response.read()
+        response.close()
+        response.release_conn()
+
+        # 2. Extract text and structure (includes concurrent embedding)
+        text = ext.extract_text_from_pdf_bytes(pdf_bytes)
+        structure = ext.extract_paper_structure(text, paper_id=arxiv_id)
+
+        # 3. Persist JSON to extracted-structures bucket
+        json_bytes = structure.model_dump_json().encode()
+        safe_id = arxiv_id.replace("/", "_")
+        _storage().client.put_object(
+            "extracted-structures",
+            f"{safe_id}.json",
+            io.BytesIO(json_bytes),
+            length=len(json_bytes),
+            content_type="application/json",
+        )
+        logger.info("Background extraction completed for %s", arxiv_id)
+
+        with _job_lock:
+            _job_status[arxiv_id] = ExtractJobStatus(arxiv_id=arxiv_id, status="completed")
+
+    except Exception as exc:
+        logger.exception("Background extraction failed for %s", arxiv_id)
+        with _job_lock:
+            _job_status[arxiv_id] = ExtractJobStatus(
+                arxiv_id=arxiv_id, status="failed", error=str(exc)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -152,50 +228,44 @@ def fetch(body: FetchRequest) -> FetchResponse:
     return FetchResponse(object_name=object_name)
 
 
-@app.post("/api/extract", response_model=PaperStructure)
-def extract(body: ExtractRequest) -> PaperStructure:
-    """Extract paper structure from a stored PDF using the configured LLM.
+@app.post("/api/extract", response_model=ExtractAccepted)
+def extract(body: ExtractRequest, background_tasks: BackgroundTasks) -> ExtractAccepted:
+    """Submit an async background extraction job for a stored PDF.
 
-    1. Fetch the PDF bytes from MinIO (raw-papers bucket).
-    2. Extract plain text with PyMuPDF.
-    3. Call the OpenAI Structured Outputs API to obtain a PaperStructure.
-    4. Persist the result as JSON in the extracted-structures bucket.
+    Returns immediately with status="pending".
+    Poll ``GET /api/extract-status/{arxiv_id}`` to track progress.
     """
-    # 1. Fetch PDF from MinIO
-    try:
-        response = _storage().client.get_object("raw-papers", body.object_name)
-        pdf_bytes = response.read()
-        response.close()
-        response.release_conn()
-    except Exception as exc:
-        logger.exception("Failed to fetch PDF from MinIO")
-        raise HTTPException(status_code=502, detail=f"MinIO fetch failed: {exc}") from exc
-
-    # 2 & 3. Extract text then structure
-    try:
-        text = ext.extract_text_from_pdf_bytes(pdf_bytes)
-        structure = ext.extract_paper_structure(text, paper_id=body.arxiv_id)
-    except EnvironmentError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception("Structure extraction failed")
-        raise HTTPException(status_code=502, detail=f"Extraction failed: {exc}") from exc
-
-    # 4. Persist JSON to extracted-structures bucket (best-effort)
-    try:
-        json_bytes = structure.model_dump_json().encode()
-        safe_id = body.arxiv_id.replace("/", "_")
-        _storage().client.put_object(
-            "extracted-structures",
-            f"{safe_id}.json",
-            io.BytesIO(json_bytes),
-            length=len(json_bytes),
-            content_type="application/json",
+    with _job_lock:
+        _job_status[body.arxiv_id] = ExtractJobStatus(
+            arxiv_id=body.arxiv_id, status="pending"
         )
-    except Exception:
-        logger.warning("Could not persist extracted structure to MinIO", exc_info=True)
+    background_tasks.add_task(_run_extraction_task, body.object_name, body.arxiv_id)
+    logger.info("Extraction job queued for %s", body.arxiv_id)
+    return ExtractAccepted(arxiv_id=body.arxiv_id, status="pending")
 
-    return structure
+
+@app.get("/api/extract-status/{arxiv_id}", response_model=ExtractJobStatus)
+def get_extract_status(arxiv_id: str) -> ExtractJobStatus:
+    """Return the current status of a background extraction job.
+
+    If no in-memory record exists but a result file is found in MinIO,
+    returns status="completed" (supports restarts / cross-session queries).
+    """
+    with _job_lock:
+        status = _job_status.get(arxiv_id)
+
+    if status is not None:
+        return status
+
+    # Check MinIO for a persisted result (e.g. server restarted after completion)
+    safe_id = arxiv_id.replace("/", "_")
+    try:
+        _storage().client.stat_object("extracted-structures", f"{safe_id}.json")
+        return ExtractJobStatus(arxiv_id=arxiv_id, status="completed")
+    except Exception:
+        raise HTTPException(
+            status_code=404, detail=f"No extraction job found for '{arxiv_id}'"
+        )
 
 
 @app.get("/api/presigned-url", response_model=PresignedUrlResponse)
