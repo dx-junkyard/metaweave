@@ -1,6 +1,12 @@
 """MetaWeave v1 — Streamlit frontend.
 
 All data access goes through the FastAPI backend (BACKEND_URL env var).
+
+非同期抽出の UX フロー:
+1. "Fetch & Store" クリック → PDF ダウンロード後、抽出ジョブをキュー登録（即時返答）
+2. 処理中の論文は processing_papers セッション状態で管理
+3. st_autorefresh で 3 秒ごとにポーリング
+4. 処理完了を検知したら st.toast で通知し、構造を自動ロード
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ import os
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit_autorefresh import st_autorefresh
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -34,16 +41,76 @@ if "paper_metadata" not in st.session_state:
     st.session_state.paper_metadata: dict[str, dict] = {}  # arxiv_id -> paper meta
 if "active_paper_id" not in st.session_state:
     st.session_state.active_paper_id: str | None = None
+# 処理中の論文: arxiv_id -> {"title": str, "object_name": str}
+if "processing_papers" not in st.session_state:
+    st.session_state.processing_papers: dict[str, dict] = {}
+# チャット履歴: arxiv_id -> list of {"role": str, "content": str}
+if "chat_histories" not in st.session_state:
+    st.session_state.chat_histories: dict[str, list[dict]] = {}
+# Auth
+if "token" not in st.session_state:
+    st.session_state.token: str | None = None
+if "user_id" not in st.session_state:
+    st.session_state.user_id: str | None = None
+if "username" not in st.session_state:
+    st.session_state.username: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Auto-refresh while jobs are in flight
+# ---------------------------------------------------------------------------
+
+if st.session_state.processing_papers:
+    st_autorefresh(interval=3_000, key="processing_autorefresh")
+
+
+# ---------------------------------------------------------------------------
+# Polling: check status of in-flight jobs and fire toasts
+# ---------------------------------------------------------------------------
+
+def _poll_processing_papers() -> None:
+    """処理中の論文のステータスを確認し、完了 / 失敗を検知する。"""
+    for arxiv_id, info in list(st.session_state.processing_papers.items()):
+        try:
+            status_data = api_extract_status(arxiv_id)
+        except Exception:
+            continue  # ネットワークエラーなどは無視して次のポーリングを待つ
+
+        status = status_data.get("status", "")
+
+        if status == "completed":
+            # 構造を自動ロード
+            try:
+                result = api_get_extract_result(arxiv_id)
+                st.session_state.structures[arxiv_id] = result
+            except Exception:
+                pass
+            title = info.get("title", arxiv_id)
+            del st.session_state.processing_papers[arxiv_id]
+            st.toast(f"解析が完了しました！", icon="✅")
+            st.rerun()
+
+        elif status == "failed":
+            error_msg = status_data.get("error", "不明なエラー")
+            title = info.get("title", arxiv_id)
+            del st.session_state.processing_papers[arxiv_id]
+            st.error(f"「{title}」 の解析に失敗しました: {error_msg}")
 
 
 # ---------------------------------------------------------------------------
 # API helpers
 # ---------------------------------------------------------------------------
 
+def _auth_headers() -> dict:
+    """Return Authorization header dict for the current session token."""
+    return {"Authorization": f"Bearer {st.session_state.token}"}
+
+
 def api_search(query: str, max_results: int) -> list[dict]:
     resp = requests.get(
         f"{BACKEND_URL}/api/search",
         params={"query": query, "max_results": max_results},
+        headers=_auth_headers(),
         timeout=60,
     )
     resp.raise_for_status()
@@ -52,7 +119,12 @@ def api_search(query: str, max_results: int) -> list[dict]:
 
 def api_fetch(paper: dict) -> str:
     """POST /api/fetch and return the MinIO object name."""
-    resp = requests.post(f"{BACKEND_URL}/api/fetch", json=paper, timeout=120)
+    resp = requests.post(
+        f"{BACKEND_URL}/api/fetch",
+        json=paper,
+        headers=_auth_headers(),
+        timeout=120,
+    )
     resp.raise_for_status()
     return resp.json()["object_name"]
 
@@ -61,6 +133,7 @@ def api_presigned_url(object_name: str) -> str:
     resp = requests.get(
         f"{BACKEND_URL}/api/presigned-url",
         params={"object_name": object_name},
+        headers=_auth_headers(),
         timeout=15,
     )
     resp.raise_for_status()
@@ -68,21 +141,36 @@ def api_presigned_url(object_name: str) -> str:
 
 
 def api_list_papers() -> list[str]:
-    resp = requests.get(f"{BACKEND_URL}/api/papers", timeout=15)
+    resp = requests.get(
+        f"{BACKEND_URL}/api/papers",
+        headers=_auth_headers(),
+        timeout=15,
+    )
     resp.raise_for_status()
     return resp.json()
 
 
 def api_extract(object_name: str, arxiv_id: str) -> dict:
-    """POST /api/extract and return the extracted PaperStructure as a dict.
-
-    Reasoning モデルは応答に数十秒〜数分かかる場合があるため timeout を長めに設定。
-    """
+    """POST /api/extract — submit async job, returns {arxiv_id, status: "pending"}."""
     resp = requests.post(
         f"{BACKEND_URL}/api/extract",
         json={"object_name": object_name, "arxiv_id": arxiv_id},
-        timeout=300,
+        headers=_auth_headers(),
+        timeout=30,
     )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def api_extract_status(arxiv_id: str) -> dict:
+    """GET /api/extract-status/{arxiv_id} — poll job status."""
+    resp = requests.get(
+        f"{BACKEND_URL}/api/extract-status/{arxiv_id}",
+        headers=_auth_headers(),
+        timeout=10,
+    )
+    if resp.status_code == 404:
+        return {"arxiv_id": arxiv_id, "status": "unknown"}
     resp.raise_for_status()
     return resp.json()
 
@@ -91,6 +179,7 @@ def api_get_extract_result(arxiv_id: str) -> dict:
     """GET /api/extract-result/{arxiv_id} — load a saved structure from MinIO."""
     resp = requests.get(
         f"{BACKEND_URL}/api/extract-result/{arxiv_id}",
+        headers=_auth_headers(),
         timeout=15,
     )
     resp.raise_for_status()
@@ -102,9 +191,122 @@ def api_update_extract_result(arxiv_id: str, structure: dict) -> None:
     resp = requests.put(
         f"{BACKEND_URL}/api/extract-result/{arxiv_id}",
         json=structure,
+        headers=_auth_headers(),
         timeout=30,
     )
     resp.raise_for_status()
+
+
+def api_chat(arxiv_id: str, message: str, history: list[dict]) -> str:
+    """POST /api/chat — RAG-based chat response (requires auth)."""
+    resp = requests.post(
+        f"{BACKEND_URL}/api/chat",
+        json={"arxiv_id": arxiv_id, "message": message, "history": history},
+        headers=_auth_headers(),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()["answer"]
+
+
+def api_get_chat_history(arxiv_id: str) -> list[dict]:
+    """GET /api/chat/history/{arxiv_id} — load chat history from Neo4j."""
+    resp = requests.get(
+        f"{BACKEND_URL}/api/chat/history/{arxiv_id}",
+        headers=_auth_headers(),
+        timeout=10,
+    )
+    if resp.status_code == 404:
+        return []
+    resp.raise_for_status()
+    return resp.json().get("history", [])
+
+
+def _auth_post(path: str, payload: dict) -> dict:
+    """Helper: POST to an auth endpoint and return the response JSON dict."""
+    resp = requests.post(f"{BACKEND_URL}{path}", json=payload, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fetch_me(token: str) -> dict:
+    """GET /api/auth/me with a Bearer token."""
+    resp = requests.get(
+        f"{BACKEND_URL}/api/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _apply_auth(token: str) -> None:
+    """Populate session state from a freshly obtained JWT."""
+    me = _fetch_me(token)
+    st.session_state.token = token
+    st.session_state.user_id = me["id"]
+    st.session_state.username = me["username"]
+
+
+# ---------------------------------------------------------------------------
+# Login / Register page
+# ---------------------------------------------------------------------------
+
+def _show_auth_page() -> None:
+    """Render the full-screen login / register page and stop execution."""
+    _, center, _ = st.columns([1, 2, 1])
+    with center:
+        st.markdown("# MetaWeave v1")
+        st.markdown("---")
+        tab_login, tab_register = st.tabs(["Login", "Register"])
+
+        with tab_login:
+            with st.form("login_form"):
+                lg_user = st.text_input("Username")
+                lg_pass = st.text_input("Password", type="password")
+                lg_submit = st.form_submit_button(
+                    "Login", use_container_width=True, type="primary"
+                )
+            if lg_submit:
+                if lg_user and lg_pass:
+                    try:
+                        data = _auth_post("/api/auth/login", {"username": lg_user, "password": lg_pass})
+                        _apply_auth(data["access_token"])
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Login failed: {exc}")
+                else:
+                    st.warning("Please enter username and password.")
+
+        with tab_register:
+            with st.form("register_form"):
+                rg_user = st.text_input("Username", key="rg_user")
+                rg_email = st.text_input("Email", key="rg_email")
+                rg_pass = st.text_input("Password", type="password", key="rg_pass")
+                rg_submit = st.form_submit_button(
+                    "Register", use_container_width=True, type="primary"
+                )
+            if rg_submit:
+                if rg_user and rg_email and rg_pass:
+                    try:
+                        data = _auth_post(
+                            "/api/auth/register",
+                            {"username": rg_user, "email": rg_email, "password": rg_pass},
+                        )
+                        _apply_auth(data["access_token"])
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Registration failed: {exc}")
+                else:
+                    st.warning("Please fill in all fields.")
+
+
+# ---------------------------------------------------------------------------
+# Polling: check status of in-flight jobs and fire toasts
+# (called here, after all API helpers are defined)
+# ---------------------------------------------------------------------------
+
+_poll_processing_papers()
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +343,102 @@ _STATUS_LABEL: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Sidebar navigation
+# Auth gate — show login page and stop if not authenticated
 # ---------------------------------------------------------------------------
 
-page = st.sidebar.radio("Navigation", ["Harvester Dashboard", "Validation View"])
+if not st.session_state.token:
+    _show_auth_page()
+    st.stop()
+
+# Top-right user info + logout button
+_, _user_col = st.columns([6, 2])
+with _user_col:
+    st.caption(f"👤 **{st.session_state.username}**")
+    if st.button("Logout", key="btn_logout", use_container_width=True):
+        st.session_state.token = None
+        st.session_state.user_id = None
+        st.session_state.username = None
+        st.rerun()
+
+# ---------------------------------------------------------------------------
+# Sidebar — Navigation + Paper list (Validation View)
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.markdown("## MetaWeave v1")
+    st.caption(f"👤 {st.session_state.username}")
+    page = st.radio("Navigation", ["Harvester Dashboard", "Validation View"])
+
+    if page == "Validation View":
+        st.divider()
+
+        # Build paper registry for sidebar list
+        _stored_sidebar: dict[str, str] = dict(st.session_state.stored_papers)
+        try:
+            _remote_sidebar = api_list_papers()
+            for _obj_s in _remote_sidebar:
+                _safe_id_s = _obj_s.rsplit("/", 1)[-1].replace(".pdf", "")
+                _stored_sidebar.setdefault(_safe_id_s, _obj_s)
+        except Exception:
+            pass
+
+        st.markdown("### Papers")
+        _search_text = st.text_input(
+            "Search",
+            placeholder="Filter by title or ID…",
+            label_visibility="collapsed",
+        )
+        _status_filter = st.selectbox(
+            "Status filter",
+            ["All", "Pending", "Approved", "Rejected"],
+            label_visibility="collapsed",
+        )
+        st.markdown("---")
+
+        for _aid, _obj_s in _stored_sidebar.items():
+            _s = st.session_state.structures.get(_aid, {})
+            _status = _s.get("review_status", "pending")
+
+            if _status_filter != "All" and _status != _status_filter.lower():
+                continue
+
+            _title: str = (
+                st.session_state.paper_metadata.get(_aid, {}).get("title")
+                or _s.get("title")
+                or _aid
+            )
+
+            if _search_text and (
+                _search_text.lower() not in _title.lower()
+                and _search_text.lower() not in _aid.lower()
+            ):
+                continue
+
+            # 処理中の論文には ⏳ アイコンを表示
+            _is_processing = _aid in st.session_state.processing_papers
+            if _is_processing:
+                _icon = "⏳"
+            else:
+                _icon = _STATUS_ICON.get(_status, "🟡")
+
+            _label = f"{_icon} {_title}" if len(_title) <= 34 else f"{_icon} {_title[:31]}…"
+            _is_active = _aid == st.session_state.active_paper_id
+
+            if st.button(
+                _label,
+                key=f"sel_{_aid}",
+                use_container_width=True,
+                type="primary" if _is_active else "secondary",
+            ):
+                st.session_state.active_paper_id = _aid
+                if _aid not in st.session_state.structures:
+                    with st.spinner("Loading…"):
+                        try:
+                            _result = api_get_extract_result(_aid)
+                            st.session_state.structures[_aid] = _result
+                        except Exception:
+                            st.session_state.structures[_aid] = _empty_structure(_aid)
+                st.rerun()
 
 # =========================================================================
 # Page A — Harvester Dashboard
@@ -169,6 +463,7 @@ if page == "Harvester Dashboard":
         st.info("Enter a query and press **Search** to fetch papers from arXiv.")
     else:
         for idx, meta in enumerate(results):
+            arxiv_id = meta["arxiv_id"]
             with st.container():
                 cols = st.columns([5, 2, 1])
                 authors = meta.get("authors", [])
@@ -184,22 +479,26 @@ if page == "Harvester Dashboard":
                 with cols[1]:
                     if meta.get("commercial_flag"):
                         st.warning("⚠ Commercial publisher suspected")
-                    stored = st.session_state.stored_papers.get(meta["arxiv_id"])
-                    if stored:
+                    stored = st.session_state.stored_papers.get(arxiv_id)
+                    is_processing = arxiv_id in st.session_state.processing_papers
+                    if is_processing:
+                        st.info("⏳ 解析中…")
+                    elif stored:
                         st.success(f"Stored: {stored}")
                 with cols[2]:
                     if st.button("Fetch & Store", key=f"fetch_{idx}"):
-                        arxiv_id = meta["arxiv_id"]
                         try:
                             with st.spinner("Downloading & storing PDF …"):
                                 object_name = api_fetch(meta)
                                 st.session_state.stored_papers[arxiv_id] = object_name
                                 st.session_state.paper_metadata[arxiv_id] = meta
-                            with st.spinner(
-                                "Extracting structure using LLM (this may take a minute) …"
-                            ):
-                                structure = api_extract(object_name, arxiv_id)
-                                st.session_state.structures[arxiv_id] = structure
+                            # 非同期抽出ジョブをキュー登録（即時返答）
+                            api_extract(object_name, arxiv_id)
+                            st.session_state.processing_papers[arxiv_id] = {
+                                "title": meta.get("title", arxiv_id),
+                                "object_name": object_name,
+                            }
+                            st.toast(f"⏳ 「{meta.get('title', arxiv_id)}」 の解析を開始しました")
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Failed: {exc}")
@@ -209,16 +508,11 @@ if page == "Harvester Dashboard":
 # Page B — Validation View
 # =========================================================================
 elif page == "Validation View":
-    st.header("Structure Validation")
-
     # Build unified paper registry: safe_id / arxiv_id -> object_name
     stored: dict[str, str] = dict(st.session_state.stored_papers)
-
-    # Enrich from backend listing (best-effort); derive key from filename
     try:
         remote = api_list_papers()
         for obj in remote:
-            # "arxiv/2024/2401.12345.pdf" → safe_id = "2401.12345"
             safe_id = obj.rsplit("/", 1)[-1].replace(".pdf", "")
             stored.setdefault(safe_id, obj)
     except Exception:
@@ -227,206 +521,175 @@ elif page == "Validation View":
     if not stored:
         st.info("No papers stored yet. Use the **Harvester Dashboard** to fetch papers first.")
     else:
-        # ----- Layout: paper list (25%) | main area (75%) -----
-        list_col, main_col = st.columns([1, 3])
+        active_id = st.session_state.active_paper_id
 
-        # ── Left panel: paper list ──────────────────────────────────────────
-        with list_col:
-            st.markdown("### Papers")
-            search_text = st.text_input(
-                "Search", placeholder="Filter by title or ID…", label_visibility="collapsed"
-            )
-            status_filter = st.selectbox(
-                "Status filter",
-                ["All", "Pending", "Approved", "Rejected"],
-                label_visibility="collapsed",
-            )
+        if not active_id or active_id not in stored:
+            st.info("← Select a paper from the sidebar to view and edit its structure.")
+        else:
+            object_name = stored[active_id]
+            is_processing = active_id in st.session_state.processing_papers
 
-            st.markdown("---")
-
-            for aid, _obj in stored.items():
-                s = st.session_state.structures.get(aid, {})
-                status = s.get("review_status", "pending")
-
-                # Apply status filter
-                if status_filter != "All" and status != status_filter.lower():
-                    continue
-
-                # Resolve display title
-                title: str = (
-                    st.session_state.paper_metadata.get(aid, {}).get("title")
-                    or s.get("title")
-                    or aid
-                )
-
-                # Apply text search
-                if search_text and (
-                    search_text.lower() not in title.lower()
-                    and search_text.lower() not in aid.lower()
-                ):
-                    continue
-
-                icon = _STATUS_ICON.get(status, "🟡")
-                label = f"{icon} {title}" if len(title) <= 34 else f"{icon} {title[:31]}…"
-                is_active = aid == st.session_state.active_paper_id
-
-                if st.button(
-                    label,
-                    key=f"sel_{aid}",
-                    use_container_width=True,
-                    type="primary" if is_active else "secondary",
-                ):
-                    st.session_state.active_paper_id = aid
-                    # Load from MinIO if not already in session state
-                    if aid not in st.session_state.structures:
-                        with st.spinner("Loading saved data…"):
-                            try:
-                                result = api_get_extract_result(aid)
-                                st.session_state.structures[aid] = result
-                            except Exception:
-                                st.session_state.structures[aid] = _empty_structure(aid)
-                    st.rerun()
-
-        # ── Right panel: PDF preview + structure editor ─────────────────────
-        with main_col:
-            active_id = st.session_state.active_paper_id
-
-            if not active_id or active_id not in stored:
-                st.info("← Select a paper from the list to view and edit its structure.")
+            # 処理中の場合は最新の構造を自動リロード
+            if active_id in st.session_state.structures:
+                s = st.session_state.structures[active_id]
             else:
-                object_name = stored[active_id]
-                s = st.session_state.structures.get(active_id, _empty_structure(active_id))
-                status = s.get("review_status", "pending")
-                title = (
-                    st.session_state.paper_metadata.get(active_id, {}).get("title")
-                    or s.get("title")
-                    or active_id
-                )
+                # MinIO から取得を試みる（完了済みかもしれない）
+                try:
+                    _loaded = api_get_extract_result(active_id)
+                    st.session_state.structures[active_id] = _loaded
+                    s = _loaded
+                except Exception:
+                    s = _empty_structure(active_id)
 
-                # Header: title, status badge, and action buttons
-                header_col, action_col = st.columns([3, 2])
-                with header_col:
-                    st.subheader(title)
-                    st.caption(f"ID: `{active_id}`  |  Status: {_STATUS_LABEL.get(status, '🟡 Pending')}")
+            status = s.get("review_status", "pending")
+            title = (
+                st.session_state.paper_metadata.get(active_id, {}).get("title")
+                or s.get("title")
+                or active_id
+            )
 
-                with action_col:
-                    act1, act2, act3 = st.columns(3)
-                    with act1:
-                        if st.button("✅ Approve", use_container_width=True, key="btn_approve"):
-                            s["review_status"] = "approved"
-                            st.session_state.structures[active_id] = s
-                            try:
-                                api_update_extract_result(active_id, s)
-                            except Exception as exc:
-                                st.warning(f"Backend sync failed: {exc}")
-                            st.rerun()
-                    with act2:
-                        if st.button("❌ Reject", use_container_width=True, key="btn_reject"):
-                            s["review_status"] = "rejected"
-                            st.session_state.structures[active_id] = s
-                            try:
-                                api_update_extract_result(active_id, s)
-                            except Exception as exc:
-                                st.warning(f"Backend sync failed: {exc}")
-                            st.rerun()
-                    with act3:
-                        if st.button("🔄 Re-Extract", use_container_width=True, key="btn_reextract"):
-                            try:
-                                with st.spinner("Re-extracting…"):
-                                    result = api_extract(object_name, active_id)
-                                    st.session_state.structures[active_id] = result
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(f"Re-extraction failed: {exc}")
+            # ── Header: prominent title + arXiv ID ───────────────────────────
+            if is_processing:
+                st.title(f"⏳ {title}")
+                st.info("バックグラウンドで解析処理中です。完了次第自動的に更新されます。")
+            else:
+                st.title(title)
+            st.caption(
+                f"arXiv ID: `{active_id}`  |  Status: {_STATUS_LABEL.get(status, '🟡 Pending')}"
+            )
 
-                st.divider()
-
-                # Two-column: PDF preview (40%) | structure editor (60%)
-                pdf_col, edit_col = st.columns([2, 3])
-
-                # ── PDF preview ──────────────────────────────────────────────
-                with pdf_col:
-                    st.markdown("**PDF Preview**")
+            # ── Action buttons (right-aligned) ───────────────────────────────
+            _, act1, act2, act3 = st.columns([6, 1, 1, 1])
+            with act1:
+                if st.button("✅ Approve", use_container_width=True, key="btn_approve"):
+                    s["review_status"] = "approved"
+                    st.session_state.structures[active_id] = s
                     try:
-                        pdf_url = api_presigned_url(object_name)
-                        # components.iframe をやめ、st.markdown で直接標準の iframe を描画する
-                        st.markdown(
-                            f'<iframe src="{pdf_url}" width="100%" height="720px" style="border: none;"></iframe>',
-                            unsafe_allow_html=True,
-                        )
+                        api_update_extract_result(active_id, s)
                     except Exception as exc:
-                        st.error(f"Could not load PDF: {exc}")
+                        st.warning(f"Backend sync failed: {exc}")
+                    st.rerun()
+            with act2:
+                if st.button("❌ Reject", use_container_width=True, key="btn_reject"):
+                    s["review_status"] = "rejected"
+                    st.session_state.structures[active_id] = s
+                    try:
+                        api_update_extract_result(active_id, s)
+                    except Exception as exc:
+                        st.warning(f"Backend sync failed: {exc}")
+                    st.rerun()
+            with act3:
+                if st.button("🔄 Re-Extract", use_container_width=True, key="btn_reextract"):
+                    try:
+                        api_extract(object_name, active_id)
+                        st.session_state.processing_papers[active_id] = {
+                            "title": title,
+                            "object_name": object_name,
+                        }
+                        st.toast(f"⏳ 「{title}」 の再解析を開始しました")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Re-extraction failed: {exc}")
 
-                # ── Structure editor ─────────────────────────────────────────
-                with edit_col:
-                    st.markdown("**Extracted Structure**")
+            st.divider()
+
+            # ── Main 2-column layout [5, 5] ──────────────────────────────────
+            pdf_col, edit_col = st.columns([5, 5])
+
+            # ── PDF Preview ──────────────────────────────────────────────────
+            with pdf_col:
+                st.markdown("**PDF Preview**")
+                try:
+                    pdf_url = api_presigned_url(object_name)
+                    st.markdown(
+                        f'<iframe src="{pdf_url}" width="100%" height="800px"'
+                        ' style="border:none; border-radius:4px;"></iframe>',
+                        unsafe_allow_html=True,
+                    )
+                except Exception as exc:
+                    st.error(f"Could not load PDF: {exc}")
+
+            # ── Structure Editor + Chat ───────────────────────────────────────
+            with edit_col:
+                struct_tab, chat_tab = st.tabs(["📄 Extracted Structure", "💬 Chat"])
+
+                # ── Structure Editor tab ──────────────────────────────────────
+                with struct_tab:
+                    if is_processing:
+                        st.markdown(
+                            "🔄 **解析処理中です。** 完了後に構造データが表示されます。"
+                        )
 
                     with st.form(f"structure_form_{active_id}"):
-                        with st.expander("Problem Statement", expanded=True):
+                        tab1, tab2, tab3 = st.tabs(
+                            ["Problem / Hypothesis", "Method / Constraints", "Abstract / Notes"]
+                        )
+
+                        with tab1:
+                            st.markdown("#### Problem Statement")
                             bg = st.text_area(
                                 "Background",
                                 value=s["problem"]["background"],
-                                height=100,
+                                height=130,
                             )
                             prob = st.text_area(
                                 "Problem",
                                 value=s["problem"]["problem"],
-                                height=100,
+                                height=130,
                             )
-
-                        with st.expander("Hypothesis"):
+                            st.markdown("#### Hypothesis")
                             hyp_stmt = st.text_area(
                                 "Statement",
                                 value=s["hypothesis"]["statement"],
-                                height=80,
+                                height=110,
                             )
                             hyp_rat = st.text_area(
                                 "Rationale",
                                 value=s["hypothesis"]["rationale"],
-                                height=80,
+                                height=110,
                             )
 
-                        with st.expander("Methodology"):
+                        with tab2:
+                            st.markdown("#### Methodology")
                             approach = st.text_area(
                                 "Approach",
                                 value=s["methodology"]["approach"],
-                                height=80,
+                                height=130,
                             )
                             techniques = st.text_area(
                                 "Techniques (one per line)",
                                 value="\n".join(s["methodology"]["techniques"]),
-                                height=80,
+                                height=110,
                             )
-
-                        with st.expander("Constraints"):
+                            st.markdown("#### Constraints")
                             assumptions = st.text_area(
                                 "Assumptions (one per line)",
                                 value="\n".join(s["constraints"]["assumptions"]),
-                                height=80,
+                                height=110,
                             )
                             limitations = st.text_area(
                                 "Limitations (one per line)",
                                 value="\n".join(s["constraints"]["limitations"]),
-                                height=80,
+                                height=110,
                             )
 
-                        with st.expander("Abstract Structure"):
+                        with tab3:
+                            st.markdown("#### Abstract Structure")
                             variables = st.text_area(
                                 "Variables (one per line)",
                                 value="\n".join(s["abstract_structure"]["variables"]),
-                                height=80,
+                                height=110,
                             )
                             edges_json = st.text_area(
                                 "Edges (JSON list)",
                                 value=json.dumps(s["abstract_structure"]["edges"], indent=2),
-                                height=120,
+                                height=150,
                             )
-
-                        with st.expander("Reviewer Notes"):
+                            st.markdown("#### Reviewer Notes")
                             notes = st.text_area(
                                 "Notes",
                                 value=s.get("reviewer_notes", ""),
-                                height=80,
+                                height=110,
                             )
 
                         save = st.form_submit_button(
@@ -479,3 +742,66 @@ elif page == "Validation View":
                         except Exception as exc:
                             st.success("Edits saved locally.")
                             st.warning(f"Backend sync failed: {exc}")
+
+                # ── Chat tab ──────────────────────────────────────────────────
+                with chat_tab:
+                    st.markdown(
+                        "論文の内容や解析結果についてAIに質問できます。"
+                        " 回答はQdrantのベクトル検索と抽出済み構造データを参照して生成されます。"
+                    )
+
+                    # 論文ごとのチャット履歴を初期化（Neo4jから取得）
+                    if active_id not in st.session_state.chat_histories:
+                        try:
+                            persisted = api_get_chat_history(active_id)
+                            st.session_state.chat_histories[active_id] = persisted
+                        except Exception:
+                            st.session_state.chat_histories[active_id] = []
+
+                    chat_history = st.session_state.chat_histories[active_id]
+
+                    # 履歴をクリアするボタン
+                    if chat_history:
+                        if st.button("🗑️ Clear chat history", key=f"clear_chat_{active_id}"):
+                            st.session_state.chat_histories[active_id] = []
+                            st.rerun()
+
+                    # 過去のメッセージを表示
+                    for turn in chat_history:
+                        with st.chat_message(turn["role"]):
+                            st.markdown(turn["content"])
+
+                    # 入力欄
+                    user_input = st.chat_input(
+                        "論文について質問してください…",
+                        key=f"chat_input_{active_id}",
+                        disabled=is_processing,
+                    )
+
+                    if is_processing:
+                        st.info("解析処理完了後にチャットを利用できます。")
+                    elif user_input:
+                        # ユーザーメッセージを即座に表示
+                        with st.chat_message("user"):
+                            st.markdown(user_input)
+
+                        # バックエンドを呼び出して回答を生成
+                        with st.chat_message("assistant"):
+                            with st.spinner("回答を生成中…"):
+                                try:
+                                    answer = api_chat(
+                                        arxiv_id=active_id,
+                                        message=user_input,
+                                        history=chat_history,
+                                    )
+                                    st.markdown(answer)
+                                    # 履歴に追加
+                                    st.session_state.chat_histories[active_id].append(
+                                        {"role": "user", "content": user_input}
+                                    )
+                                    st.session_state.chat_histories[active_id].append(
+                                        {"role": "assistant", "content": answer}
+                                    )
+                                except Exception as exc:
+                                    error_msg = f"チャットエラー: {exc}"
+                                    st.error(error_msg)
