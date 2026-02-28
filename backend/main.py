@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime
 import io
+import json
 import logging
 import os
 import threading
@@ -150,6 +151,12 @@ class ChatResponse(BaseModel):
     """Response from the RAG chat endpoint."""
 
     answer: str
+
+
+class ChatHistoryResponse(BaseModel):
+    """Response from the chat history endpoint."""
+
+    history: list[dict]
 
 
 class ProposeStructureRequest(BaseModel):
@@ -447,11 +454,14 @@ def update_extract_result(arxiv_id: str, body: PaperStructure) -> PaperStructure
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(body: ChatRequest) -> ChatResponse:
-    """RAG-based chat endpoint.
+def chat(
+    body: ChatRequest,
+    current_user: dict = Depends(_get_current_user),
+) -> ChatResponse:
+    """RAG-based chat endpoint (requires authentication).
 
     ユーザーの質問を受け取り、Qdrant のベクトル検索と MinIO の PaperStructure を
-    組み合わせて LLM に回答を生成させる。
+    組み合わせて LLM に回答を生成させる。回答後、チャット履歴を Neo4j に永続化する。
     """
     try:
         answer = generate_chat_response(
@@ -464,7 +474,61 @@ def chat(body: ChatRequest) -> ChatResponse:
         logger.exception("Chat generation failed for %s", body.arxiv_id)
         raise HTTPException(status_code=500, detail=f"Chat failed: {exc}") from exc
 
+    # Persist updated chat history to Neo4j
+    updated_history = body.history + [
+        {"role": "user", "content": body.message},
+        {"role": "assistant", "content": answer},
+    ]
+    try:
+        driver = get_driver()
+        with driver.session() as session:
+            session.run(
+                """
+                MERGE (u:User {id: $user_id})
+                MERGE (p:Paper {arxiv_id: $arxiv_id})
+                MERGE (u)-[r:CHATTED_ABOUT]->(p)
+                SET r.history = $history
+                """,
+                user_id=current_user["id"],
+                arxiv_id=body.arxiv_id,
+                history=json.dumps(updated_history, ensure_ascii=False),
+            )
+    except Exception:
+        logger.exception(
+            "Failed to persist chat history for user=%s arxiv_id=%s",
+            current_user["id"],
+            body.arxiv_id,
+        )
+
     return ChatResponse(answer=answer)
+
+
+@app.get("/api/chat/history/{arxiv_id}", response_model=ChatHistoryResponse)
+def get_chat_history(
+    arxiv_id: str,
+    current_user: dict = Depends(_get_current_user),
+) -> ChatHistoryResponse:
+    """ログイン中のユーザーの特定論文に対するチャット履歴を Neo4j から取得して返す。"""
+    driver = get_driver()
+    with driver.session() as session:
+        record = session.run(
+            """
+            MATCH (u:User {id: $user_id})-[r:CHATTED_ABOUT]->(p:Paper {arxiv_id: $arxiv_id})
+            RETURN r.history AS history
+            """,
+            user_id=current_user["id"],
+            arxiv_id=arxiv_id,
+        ).single()
+
+    if not record or not record["history"]:
+        return ChatHistoryResponse(history=[])
+
+    try:
+        history = json.loads(record["history"])
+    except Exception:
+        history = []
+
+    return ChatHistoryResponse(history=history)
 
 
 # ---------------------------------------------------------------------------

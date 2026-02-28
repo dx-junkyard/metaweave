@@ -101,10 +101,16 @@ def _poll_processing_papers() -> None:
 # API helpers
 # ---------------------------------------------------------------------------
 
+def _auth_headers() -> dict:
+    """Return Authorization header dict for the current session token."""
+    return {"Authorization": f"Bearer {st.session_state.token}"}
+
+
 def api_search(query: str, max_results: int) -> list[dict]:
     resp = requests.get(
         f"{BACKEND_URL}/api/search",
         params={"query": query, "max_results": max_results},
+        headers=_auth_headers(),
         timeout=60,
     )
     resp.raise_for_status()
@@ -113,7 +119,12 @@ def api_search(query: str, max_results: int) -> list[dict]:
 
 def api_fetch(paper: dict) -> str:
     """POST /api/fetch and return the MinIO object name."""
-    resp = requests.post(f"{BACKEND_URL}/api/fetch", json=paper, timeout=120)
+    resp = requests.post(
+        f"{BACKEND_URL}/api/fetch",
+        json=paper,
+        headers=_auth_headers(),
+        timeout=120,
+    )
     resp.raise_for_status()
     return resp.json()["object_name"]
 
@@ -122,6 +133,7 @@ def api_presigned_url(object_name: str) -> str:
     resp = requests.get(
         f"{BACKEND_URL}/api/presigned-url",
         params={"object_name": object_name},
+        headers=_auth_headers(),
         timeout=15,
     )
     resp.raise_for_status()
@@ -129,7 +141,11 @@ def api_presigned_url(object_name: str) -> str:
 
 
 def api_list_papers() -> list[str]:
-    resp = requests.get(f"{BACKEND_URL}/api/papers", timeout=15)
+    resp = requests.get(
+        f"{BACKEND_URL}/api/papers",
+        headers=_auth_headers(),
+        timeout=15,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -139,6 +155,7 @@ def api_extract(object_name: str, arxiv_id: str) -> dict:
     resp = requests.post(
         f"{BACKEND_URL}/api/extract",
         json={"object_name": object_name, "arxiv_id": arxiv_id},
+        headers=_auth_headers(),
         timeout=30,
     )
     resp.raise_for_status()
@@ -149,6 +166,7 @@ def api_extract_status(arxiv_id: str) -> dict:
     """GET /api/extract-status/{arxiv_id} — poll job status."""
     resp = requests.get(
         f"{BACKEND_URL}/api/extract-status/{arxiv_id}",
+        headers=_auth_headers(),
         timeout=10,
     )
     if resp.status_code == 404:
@@ -161,6 +179,7 @@ def api_get_extract_result(arxiv_id: str) -> dict:
     """GET /api/extract-result/{arxiv_id} — load a saved structure from MinIO."""
     resp = requests.get(
         f"{BACKEND_URL}/api/extract-result/{arxiv_id}",
+        headers=_auth_headers(),
         timeout=15,
     )
     resp.raise_for_status()
@@ -172,20 +191,35 @@ def api_update_extract_result(arxiv_id: str, structure: dict) -> None:
     resp = requests.put(
         f"{BACKEND_URL}/api/extract-result/{arxiv_id}",
         json=structure,
+        headers=_auth_headers(),
         timeout=30,
     )
     resp.raise_for_status()
 
 
 def api_chat(arxiv_id: str, message: str, history: list[dict]) -> str:
-    """POST /api/chat — RAG-based chat response."""
+    """POST /api/chat — RAG-based chat response (requires auth)."""
     resp = requests.post(
         f"{BACKEND_URL}/api/chat",
         json={"arxiv_id": arxiv_id, "message": message, "history": history},
+        headers=_auth_headers(),
         timeout=60,
     )
     resp.raise_for_status()
     return resp.json()["answer"]
+
+
+def api_get_chat_history(arxiv_id: str) -> list[dict]:
+    """GET /api/chat/history/{arxiv_id} — load chat history from Neo4j."""
+    resp = requests.get(
+        f"{BACKEND_URL}/api/chat/history/{arxiv_id}",
+        headers=_auth_headers(),
+        timeout=10,
+    )
+    if resp.status_code == 404:
+        return []
+    resp.raise_for_status()
+    return resp.json().get("history", [])
 
 
 def _auth_post(path: str, payload: dict) -> dict:
@@ -716,9 +750,13 @@ elif page == "Validation View":
                         " 回答はQdrantのベクトル検索と抽出済み構造データを参照して生成されます。"
                     )
 
-                    # 論文ごとのチャット履歴を初期化
+                    # 論文ごとのチャット履歴を初期化（Neo4jから取得）
                     if active_id not in st.session_state.chat_histories:
-                        st.session_state.chat_histories[active_id] = []
+                        try:
+                            persisted = api_get_chat_history(active_id)
+                            st.session_state.chat_histories[active_id] = persisted
+                        except Exception:
+                            st.session_state.chat_histories[active_id] = []
 
                     chat_history = st.session_state.chat_histories[active_id]
 
