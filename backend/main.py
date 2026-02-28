@@ -36,10 +36,13 @@ from passlib.context import CryptContext
 from pydantic import BaseModel
 
 from metaweave import extractor as ext
+from metaweave.batch import run_pattern_evaluation_task
 from metaweave.chat import generate_chat_response
 from metaweave.db import get_driver
+from metaweave.embedder import embed_and_store_pattern
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
-from metaweave.schema import PaperStructure, StructureProposal
+from metaweave.llm import get_client, get_settings
+from metaweave.schema import AbstractionPattern, PaperStructure, PatternMatch, StructureProposal
 from metaweave.storage import StorageManager
 
 logging.basicConfig(level=logging.INFO)
@@ -211,6 +214,51 @@ class UserOut(BaseModel):
     id: str
     username: str
     email: str
+
+
+# ---------------------------------------------------------------------------
+# Pattern request / response models
+# ---------------------------------------------------------------------------
+
+class PatternExtractAccepted(BaseModel):
+    """Immediate response for an accepted pattern extraction job."""
+
+    arxiv_id: str
+    status: str = "pending"
+
+
+class PatternOut(BaseModel):
+    """Public representation of an AbstractionPattern."""
+
+    pattern_id: str
+    name: str
+    description: str
+    variables_template: list[str]
+    structural_rules: list[str]
+    source_arxiv_id: str
+
+
+class PatternListResponse(BaseModel):
+    """List of patterns."""
+
+    patterns: list[PatternOut]
+
+
+class PatternMatchOut(BaseModel):
+    """A pattern match result for a paper."""
+
+    match_id: str
+    pattern_id: str
+    pattern_name: str | None = None
+    target_arxiv_id: str
+    mapping_explanation: str
+    confidence_score: float
+
+
+class PaperPatternListResponse(BaseModel):
+    """List of pattern matches for a specific paper."""
+
+    matches: list[PatternMatchOut]
 
 
 # ---------------------------------------------------------------------------
@@ -785,3 +833,213 @@ def auth_login(body: LoginRequest) -> TokenResponse:
 def auth_me(current_user: dict = Depends(_get_current_user)) -> UserOut:
     """Bearer トークンからデコードした現在のユーザー情報を返す。"""
     return UserOut(**current_user)
+
+
+# ---------------------------------------------------------------------------
+# Background pattern extraction + batch evaluation task
+# ---------------------------------------------------------------------------
+
+def _run_pattern_extraction_task(arxiv_id: str) -> None:
+    """バックグラウンドで実行されるパターン抽出 + 再評価バッチタスク。
+
+    1. MinIO から PaperStructure をロード
+    2. LLM でパターンを抽出
+    3. Neo4j にパターンノードを保存
+    4. Qdrant にパターンの Embedding を保存
+    5. 過去の論文に対して構造的同型性を評価（バッチ）
+    """
+    logger.info("Pattern extraction started for %s", arxiv_id)
+
+    # 1. PaperStructure をロード
+    safe_id = arxiv_id.replace("/", "_")
+    try:
+        response = _storage().client.get_object("extracted-structures", f"{safe_id}.json")
+        data = response.read()
+        response.close()
+        response.release_conn()
+        structure = PaperStructure.model_validate_json(data)
+    except Exception:
+        logger.exception("Failed to load PaperStructure for %s", arxiv_id)
+        return
+
+    # 2. LLM でパターン抽出
+    try:
+        pattern = ext.extract_abstraction_pattern(structure)
+    except Exception:
+        logger.exception("Pattern extraction failed for %s", arxiv_id)
+        return
+
+    logger.info("Pattern extracted: %s (id=%s)", pattern.name, pattern.pattern_id)
+
+    # 3. Neo4j にパターンノードを保存
+    try:
+        driver = get_driver()
+        with driver.session() as session:
+            session.run(
+                """
+                MERGE (p:Paper {arxiv_id: $source_arxiv_id})
+                CREATE (ap:AbstractionPattern {
+                    pattern_id:         $pattern_id,
+                    name:               $name,
+                    description:        $description,
+                    variables_template: $variables_template,
+                    structural_rules:   $structural_rules,
+                    source_arxiv_id:    $source_arxiv_id
+                })
+                CREATE (p)-[:HAS_PATTERN]->(ap)
+                """,
+                pattern_id=pattern.pattern_id,
+                name=pattern.name,
+                description=pattern.description,
+                variables_template=json.dumps(pattern.variables_template),
+                structural_rules=json.dumps(pattern.structural_rules),
+                source_arxiv_id=pattern.source_arxiv_id,
+            )
+        logger.info("Pattern %s saved to Neo4j", pattern.pattern_id)
+    except Exception:
+        logger.exception("Failed to save pattern %s to Neo4j", pattern.pattern_id)
+        return
+
+    # 4. Qdrant にパターンの Embedding を保存
+    try:
+        client = get_client()
+        settings = get_settings()
+        rules_text = "; ".join(pattern.structural_rules) if pattern.structural_rules else ""
+        pattern_text = f"{pattern.name}. {pattern.description} Rules: {rules_text}"
+        embed_and_store_pattern(
+            pattern_id=pattern.pattern_id,
+            pattern_text=pattern_text,
+            openai_client=client,
+            embedding_model=settings.embedding_model,
+        )
+    except Exception:
+        logger.warning("Pattern embedding failed for %s (continuing)", pattern.pattern_id, exc_info=True)
+
+    # 5. 過去の論文に対してバッチ評価
+    try:
+        matches = run_pattern_evaluation_task(pattern, _storage().client)
+        logger.info(
+            "Batch evaluation completed for pattern %s: %d matches",
+            pattern.pattern_id, len(matches),
+        )
+    except Exception:
+        logger.exception("Batch evaluation failed for pattern %s", pattern.pattern_id)
+
+
+# ---------------------------------------------------------------------------
+# Pattern API endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/patterns/extract/{arxiv_id}", response_model=PatternExtractAccepted)
+def extract_pattern(
+    arxiv_id: str,
+    background_tasks: BackgroundTasks,
+) -> PatternExtractAccepted:
+    """指定論文から抽象化パターンを抽出するバックグラウンドジョブを開始する。
+
+    パターン抽出後、自動的に過去論文への再評価バッチも実行される。
+    """
+    # PaperStructure が存在するか確認
+    safe_id = arxiv_id.replace("/", "_")
+    try:
+        _storage().client.stat_object("extracted-structures", f"{safe_id}.json")
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No extracted structure found for '{arxiv_id}'. Extract the paper first.",
+        )
+
+    background_tasks.add_task(_run_pattern_extraction_task, arxiv_id)
+    logger.info("Pattern extraction job queued for %s", arxiv_id)
+    return PatternExtractAccepted(arxiv_id=arxiv_id, status="pending")
+
+
+@app.get("/api/patterns", response_model=PatternListResponse)
+def list_patterns() -> PatternListResponse:
+    """登録済みの全パターン一覧を Neo4j から取得する。"""
+    driver = get_driver()
+    with driver.session() as session:
+        records = session.run(
+            """
+            MATCH (ap:AbstractionPattern)
+            RETURN ap.pattern_id         AS pattern_id,
+                   ap.name               AS name,
+                   ap.description         AS description,
+                   ap.variables_template  AS variables_template,
+                   ap.structural_rules    AS structural_rules,
+                   ap.source_arxiv_id     AS source_arxiv_id
+            ORDER BY ap.name
+            """
+        ).data()
+
+    patterns = []
+    for r in records:
+        # variables_template と structural_rules は JSON 文字列で保存されている
+        vt = r.get("variables_template", "[]")
+        sr = r.get("structural_rules", "[]")
+        try:
+            vt_parsed = json.loads(vt) if isinstance(vt, str) else vt
+        except Exception:
+            vt_parsed = []
+        try:
+            sr_parsed = json.loads(sr) if isinstance(sr, str) else sr
+        except Exception:
+            sr_parsed = []
+
+        patterns.append(
+            PatternOut(
+                pattern_id=r["pattern_id"],
+                name=r.get("name", ""),
+                description=r.get("description", ""),
+                variables_template=vt_parsed,
+                structural_rules=sr_parsed,
+                source_arxiv_id=r.get("source_arxiv_id", ""),
+            )
+        )
+
+    return PatternListResponse(patterns=patterns)
+
+
+@app.get("/api/papers/{arxiv_id}/patterns", response_model=PaperPatternListResponse)
+def get_paper_patterns(arxiv_id: str) -> PaperPatternListResponse:
+    """指定論文にマッチしたパターン一覧を Neo4j から取得する。
+
+    HAS_PATTERN（元論文 → パターン）と MATCHES_PATTERN（マッチ先論文 → パターン）
+    の両方を検索する。
+    """
+    driver = get_driver()
+    with driver.session() as session:
+        records = session.run(
+            """
+            MATCH (p:Paper {arxiv_id: $arxiv_id})-[r:MATCHES_PATTERN]->(ap:AbstractionPattern)
+            RETURN r.match_id             AS match_id,
+                   ap.pattern_id          AS pattern_id,
+                   ap.name                AS pattern_name,
+                   $arxiv_id              AS target_arxiv_id,
+                   r.mapping_explanation  AS mapping_explanation,
+                   r.confidence_score     AS confidence_score
+            UNION
+            MATCH (p:Paper {arxiv_id: $arxiv_id})-[:HAS_PATTERN]->(ap:AbstractionPattern)
+            RETURN ap.pattern_id          AS match_id,
+                   ap.pattern_id          AS pattern_id,
+                   ap.name                AS pattern_name,
+                   $arxiv_id              AS target_arxiv_id,
+                   'Source paper'         AS mapping_explanation,
+                   1.0                    AS confidence_score
+            """,
+            arxiv_id=arxiv_id,
+        ).data()
+
+    matches = [
+        PatternMatchOut(
+            match_id=r.get("match_id", ""),
+            pattern_id=r.get("pattern_id", ""),
+            pattern_name=r.get("pattern_name"),
+            target_arxiv_id=r.get("target_arxiv_id", ""),
+            mapping_explanation=r.get("mapping_explanation", ""),
+            confidence_score=float(r.get("confidence_score", 0.0)),
+        )
+        for r in records
+    ]
+
+    return PaperPatternListResponse(matches=matches)

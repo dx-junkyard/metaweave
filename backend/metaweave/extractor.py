@@ -30,7 +30,7 @@ from typing import Any
 import fitz  # PyMuPDF
 
 from metaweave.llm import get_client, get_settings
-from metaweave.schema import MergeResult, PaperStructure
+from metaweave.schema import AbstractionPattern, MergeResult, PaperStructure
 
 logger = logging.getLogger(__name__)
 
@@ -380,3 +380,49 @@ def evaluate_and_merge_proposals(
         ),
         evaluation_reasoning=result.evaluation_reasoning,
     )
+
+
+# ---------------------------------------------------------------------------
+# Public: 抽象化パターン抽出 (Public層)
+# ---------------------------------------------------------------------------
+
+def extract_abstraction_pattern(structure: PaperStructure) -> AbstractionPattern:
+    """承認済み PaperStructure から汎用的な抽象化パターンを LLM で抽出する。
+
+    Evo-DKD アプローチに基づき、具体的事象を変数（X, Y, Z 等）に置換して
+    分野横断で適用可能な「問題解決の型」を生成する。
+
+    Parameters
+    ----------
+    structure:
+        パターン抽出対象の PaperStructure（review_status が approved 推奨）。
+
+    Returns
+    -------
+    AbstractionPattern
+        抽出された抽象化パターン。source_arxiv_id には元論文のIDがセットされる。
+    """
+    client = get_client()
+    settings = get_settings()
+
+    prompt = (
+        "あなたはメタ構造転写エンジンの一部です。\n"
+        "以下の論文構造データから、具体的な事象を「変数（X, Y, Z等）」に置き換え、\n"
+        "分野横断で適用可能な汎用的な「問題解決の型（Abstraction Pattern）」を抽出してください。\n\n"
+        "【ルール】\n"
+        "- name: パターンの簡潔な名称（英語、20語以内）\n"
+        "- description: パターンの説明（具体的なドメイン用語は使わず、抽象変数で記述）\n"
+        "- variables_template: パターン内で使われる抽象変数のリスト（例: [\"X\", \"Y\", \"Z\"]）\n"
+        "- structural_rules: 変数間の関係ルール（例: [\"X inhibits Y\", \"Y enables Z\"]）\n\n"
+        f"--- 論文構造データ ---\n{structure.model_dump_json(indent=2)}\n\n"
+        f'source_arxiv_id は "{structure.paper_id}" を設定してください。\n'
+        "JSONスキーマに厳格に従って出力してください。"
+    )
+
+    resp = client.beta.chat.completions.parse(
+        model=settings.analysis_model,
+        messages=[{"role": "user", "content": prompt}],
+        response_format=AbstractionPattern,
+    )
+    pattern: AbstractionPattern = resp.choices[0].message.parsed
+    return pattern.model_copy(update={"source_arxiv_id": structure.paper_id})
