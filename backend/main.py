@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from metaweave import extractor as ext
+from metaweave.chat import generate_chat_response
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
 from metaweave.schema import PaperStructure
 from metaweave.storage import StorageManager
@@ -113,6 +114,20 @@ class ExtractJobStatus(BaseModel):
     arxiv_id: str
     status: str  # pending | processing | completed | failed
     error: str | None = None
+
+
+class ChatRequest(BaseModel):
+    """Request body for the RAG chat endpoint."""
+
+    arxiv_id: str
+    message: str
+    history: list[dict] = []
+
+
+class ChatResponse(BaseModel):
+    """Response from the RAG chat endpoint."""
+
+    answer: str
 
 
 # ---------------------------------------------------------------------------
@@ -333,3 +348,24 @@ def update_extract_result(arxiv_id: str, body: PaperStructure) -> PaperStructure
         logger.exception("Failed to update extract result in MinIO")
         raise HTTPException(status_code=500, detail=f"Update failed: {exc}") from exc
     return body
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(body: ChatRequest) -> ChatResponse:
+    """RAG-based chat endpoint.
+
+    ユーザーの質問を受け取り、Qdrant のベクトル検索と MinIO の PaperStructure を
+    組み合わせて LLM に回答を生成させる。
+    """
+    try:
+        answer = generate_chat_response(
+            arxiv_id=body.arxiv_id,
+            message=body.message,
+            history=body.history,
+            minio_client=_storage().client,
+        )
+    except Exception as exc:
+        logger.exception("Chat generation failed for %s", body.arxiv_id)
+        raise HTTPException(status_code=500, detail=f"Chat failed: {exc}") from exc
+
+    return ChatResponse(answer=answer)
