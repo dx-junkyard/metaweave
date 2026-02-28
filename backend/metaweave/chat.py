@@ -42,9 +42,9 @@ def search_chunks(question: str, arxiv_id: str, top_k: int = 5) -> list[str]:
 
     query_vector = _embed_query(question, client, settings.embedding_model)
 
-    results = _qdrant().search(
+    result = _qdrant().query_points(
         collection_name=_COLLECTION,
-        query_vector=query_vector,
+        query=query_vector,
         query_filter=Filter(
             must=[
                 FieldCondition(
@@ -57,7 +57,7 @@ def search_chunks(question: str, arxiv_id: str, top_k: int = 5) -> list[str]:
         with_payload=True,
     )
 
-    return [hit.payload.get("text", "") for hit in results if hit.payload]
+    return [hit.payload.get("text", "") for hit in result.points if hit.payload]
 
 
 def _get_paper_structure(arxiv_id: str, minio_client) -> dict:
