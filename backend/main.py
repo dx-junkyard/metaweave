@@ -10,7 +10,11 @@ GET  /api/extract-result/{arxiv_id}     Fetch a previously extracted paper struc
 PUT  /api/extract-result/{arxiv_id}     Update an extracted paper structure in MinIO.
 GET  /api/presigned-url                 Return a browser-accessible pre-signed URL for a stored PDF.
 GET  /api/papers                        List all stored paper object names.
+GET  /api/draft/{arxiv_id}              Get user's private draft from Neo4j.
+PUT  /api/draft/{arxiv_id}              Save/upsert user's private draft in Neo4j.
 POST /api/propose-structure             Submit a user structure proposal (saved to Neo4j, async LLM review).
+POST /api/patterns/extract/{arxiv_id}   Preview pattern extraction (no DB save).
+POST /api/patterns/register             Register a confirmed pattern to Qdrant/Neo4j.
 POST /api/auth/register                 Register a new user (Neo4j User node, returns JWT).
 POST /api/auth/login                    Authenticate and return a JWT.
 GET  /api/auth/me                       Return the current user's profile (requires Bearer token).
@@ -125,6 +129,8 @@ class PresignedUrlResponse(BaseModel):
 class ExtractRequest(BaseModel):
     object_name: str
     arxiv_id: str
+    is_draft: bool = False
+    user_id: str | None = None
 
 
 class ExtractAccepted(BaseModel):
@@ -261,6 +267,32 @@ class PaperPatternListResponse(BaseModel):
     matches: list[PatternMatchOut]
 
 
+class DraftResponse(BaseModel):
+    """Response for GET /api/draft/{arxiv_id}."""
+
+    arxiv_id: str
+    structure: PaperStructure
+
+
+class DraftSaveRequest(BaseModel):
+    """Request body for PUT /api/draft/{arxiv_id}."""
+
+    structure: PaperStructure
+
+
+class PatternRegisterRequest(BaseModel):
+    """Request body for POST /api/patterns/register."""
+
+    pattern: AbstractionPattern
+
+
+class PatternRegisterResponse(BaseModel):
+    """Response for POST /api/patterns/register."""
+
+    pattern_id: str
+    status: str = "registered"
+
+
 # ---------------------------------------------------------------------------
 # Auth utility functions
 # ---------------------------------------------------------------------------
@@ -302,13 +334,19 @@ def _get_current_user(
 # Background extraction task
 # ---------------------------------------------------------------------------
 
-def _run_extraction_task(object_name: str, arxiv_id: str) -> None:
+def _run_extraction_task(
+    object_name: str,
+    arxiv_id: str,
+    is_draft: bool = False,
+    user_id: str | None = None,
+) -> None:
     """バックグラウンドで実行される抽出タスク。
 
     1. ステータスを "processing" に更新
     2. MinIO から PDF を取得
     3. テキスト抽出 → 仮説検証型チャンク解析 → Embedding（並行）
-    4. 結果を MinIO に保存
+    4. is_draft=False の場合は MinIO に保存（従来どおり）、
+       is_draft=True の場合は Neo4j のユーザードラフトとして保存
     5. ステータスを "completed" または "failed" に更新
     """
     with _job_lock:
@@ -316,7 +354,7 @@ def _run_extraction_task(object_name: str, arxiv_id: str) -> None:
 
     try:
         # 1. Fetch PDF from MinIO
-        logger.info("Background extraction started for %s", arxiv_id)
+        logger.info("Background extraction started for %s (is_draft=%s)", arxiv_id, is_draft)
         response = _storage().client.get_object("raw-papers", object_name)
         pdf_bytes = response.read()
         response.close()
@@ -326,17 +364,37 @@ def _run_extraction_task(object_name: str, arxiv_id: str) -> None:
         text = ext.extract_text_from_pdf_bytes(pdf_bytes)
         structure = ext.extract_paper_structure(text, paper_id=arxiv_id)
 
-        # 3. Persist JSON to extracted-structures bucket
-        json_bytes = structure.model_dump_json().encode()
-        safe_id = arxiv_id.replace("/", "_")
-        _storage().client.put_object(
-            "extracted-structures",
-            f"{safe_id}.json",
-            io.BytesIO(json_bytes),
-            length=len(json_bytes),
-            content_type="application/json",
-        )
-        logger.info("Background extraction completed for %s", arxiv_id)
+        if is_draft and user_id:
+            # 3a. ドラフトモード: Neo4j のユーザードラフトとして保存
+            structure_json = structure.model_dump_json()
+            driver = get_driver()
+            with driver.session() as session:
+                session.run(
+                    """
+                    MERGE (u:User {id: $user_id})
+                    MERGE (d:Draft {arxiv_id: $arxiv_id, user_id: $user_id})
+                    MERGE (u)-[:HAS_DRAFT]->(d)
+                    SET d.structure = $structure_json,
+                        d.updated_at = $updated_at
+                    """,
+                    user_id=user_id,
+                    arxiv_id=arxiv_id,
+                    structure_json=structure_json,
+                    updated_at=datetime.datetime.utcnow().isoformat(),
+                )
+            logger.info("Draft extraction saved to Neo4j for %s (user=%s)", arxiv_id, user_id)
+        else:
+            # 3b. 通常モード: MinIO の extracted-structures バケットに保存
+            json_bytes = structure.model_dump_json().encode()
+            safe_id = arxiv_id.replace("/", "_")
+            _storage().client.put_object(
+                "extracted-structures",
+                f"{safe_id}.json",
+                io.BytesIO(json_bytes),
+                length=len(json_bytes),
+                content_type="application/json",
+            )
+            logger.info("Background extraction completed for %s", arxiv_id)
 
         with _job_lock:
             _job_status[arxiv_id] = ExtractJobStatus(arxiv_id=arxiv_id, status="completed")
@@ -417,13 +475,22 @@ def extract(body: ExtractRequest, background_tasks: BackgroundTasks) -> ExtractA
 
     Returns immediately with status="pending".
     Poll ``GET /api/extract-status/{arxiv_id}`` to track progress.
+
+    When ``is_draft=True`` and ``user_id`` is provided, the extraction result is
+    saved as a private Neo4j draft instead of overwriting the canonical MinIO store.
     """
     with _job_lock:
         _job_status[body.arxiv_id] = ExtractJobStatus(
             arxiv_id=body.arxiv_id, status="pending"
         )
-    background_tasks.add_task(_run_extraction_task, body.object_name, body.arxiv_id)
-    logger.info("Extraction job queued for %s", body.arxiv_id)
+    background_tasks.add_task(
+        _run_extraction_task,
+        body.object_name,
+        body.arxiv_id,
+        is_draft=body.is_draft,
+        user_id=body.user_id,
+    )
+    logger.info("Extraction job queued for %s (is_draft=%s)", body.arxiv_id, body.is_draft)
     return ExtractAccepted(arxiv_id=body.arxiv_id, status="pending")
 
 
@@ -516,6 +583,63 @@ def update_extract_result(arxiv_id: str, body: PaperStructure) -> PaperStructure
         logger.exception("Failed to update extract result in MinIO")
         raise HTTPException(status_code=500, detail=f"Update failed: {exc}") from exc
     return body
+
+
+@app.get("/api/draft/{arxiv_id}", response_model=DraftResponse)
+def get_draft(
+    arxiv_id: str,
+    current_user: dict = Depends(_get_current_user),
+) -> DraftResponse:
+    """ログインユーザーの指定論文に対するプライベートドラフトを Neo4j から取得する。"""
+    driver = get_driver()
+    with driver.session() as session:
+        record = session.run(
+            """
+            MATCH (u:User {id: $user_id})-[:HAS_DRAFT]->(d:Draft {arxiv_id: $arxiv_id})
+            RETURN d.structure AS structure
+            """,
+            user_id=current_user["id"],
+            arxiv_id=arxiv_id,
+        ).single()
+
+    if not record or not record["structure"]:
+        raise HTTPException(status_code=404, detail="No draft found")
+
+    try:
+        structure = PaperStructure.model_validate_json(record["structure"])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to parse draft structure: {exc}"
+        ) from exc
+
+    return DraftResponse(arxiv_id=arxiv_id, structure=structure)
+
+
+@app.put("/api/draft/{arxiv_id}", response_model=DraftResponse)
+def save_draft(
+    arxiv_id: str,
+    body: DraftSaveRequest,
+    current_user: dict = Depends(_get_current_user),
+) -> DraftResponse:
+    """ログインユーザーのドラフトを Neo4j に保存（UPSERT）する。"""
+    structure_json = body.structure.model_dump_json()
+    driver = get_driver()
+    with driver.session() as session:
+        session.run(
+            """
+            MERGE (u:User {id: $user_id})
+            MERGE (d:Draft {arxiv_id: $arxiv_id, user_id: $user_id})
+            MERGE (u)-[:HAS_DRAFT]->(d)
+            SET d.structure = $structure_json,
+                d.updated_at = $updated_at
+            """,
+            user_id=current_user["id"],
+            arxiv_id=arxiv_id,
+            structure_json=structure_json,
+            updated_at=datetime.datetime.utcnow().isoformat(),
+        )
+    logger.info("Draft saved for user=%s arxiv_id=%s", current_user["id"], arxiv_id)
+    return DraftResponse(arxiv_id=arxiv_id, structure=body.structure)
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -839,18 +963,34 @@ def auth_me(current_user: dict = Depends(_get_current_user)) -> UserOut:
 # Background pattern extraction + batch evaluation task
 # ---------------------------------------------------------------------------
 
-def _run_pattern_extraction_task(arxiv_id: str) -> None:
-    """バックグラウンドで実行されるパターン抽出 + 再評価バッチタスク。
+def _run_pattern_evaluation_task(pattern: AbstractionPattern) -> None:
+    """バックグラウンドで実行されるパターン再評価バッチタスク。
 
-    1. MinIO から PaperStructure をロード
-    2. LLM でパターンを抽出
-    3. Neo4j にパターンノードを保存
-    4. Qdrant にパターンの Embedding を保存
-    5. 過去の論文に対して構造的同型性を評価（バッチ）
+    登録済みパターンに対して、過去の論文への構造的同型性を評価する。
     """
-    logger.info("Pattern extraction started for %s", arxiv_id)
+    try:
+        matches = run_pattern_evaluation_task(pattern, _storage().client)
+        logger.info(
+            "Batch evaluation completed for pattern %s: %d matches",
+            pattern.pattern_id, len(matches),
+        )
+    except Exception:
+        logger.exception("Batch evaluation failed for pattern %s", pattern.pattern_id)
 
-    # 1. PaperStructure をロード
+
+# ---------------------------------------------------------------------------
+# Pattern API endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/patterns/extract/{arxiv_id}", response_model=AbstractionPattern)
+def extract_pattern_preview(
+    arxiv_id: str,
+) -> AbstractionPattern:
+    """指定論文から抽象化パターンを抽出し、プレビュー用にレスポンスとして返す。
+
+    DB（Qdrant / Neo4j）には保存しない。ユーザーが結果を確認・修正した後、
+    ``POST /api/patterns/register`` で正式登録する。
+    """
     safe_id = arxiv_id.replace("/", "_")
     try:
         response = _storage().client.get_object("extracted-structures", f"{safe_id}.json")
@@ -859,19 +999,37 @@ def _run_pattern_extraction_task(arxiv_id: str) -> None:
         response.release_conn()
         structure = PaperStructure.model_validate_json(data)
     except Exception:
-        logger.exception("Failed to load PaperStructure for %s", arxiv_id)
-        return
+        raise HTTPException(
+            status_code=404,
+            detail=f"No extracted structure found for '{arxiv_id}'. Extract the paper first.",
+        )
 
-    # 2. LLM でパターン抽出
     try:
         pattern = ext.extract_abstraction_pattern(structure)
-    except Exception:
-        logger.exception("Pattern extraction failed for %s", arxiv_id)
-        return
+    except Exception as exc:
+        logger.exception("Pattern extraction preview failed for %s", arxiv_id)
+        raise HTTPException(
+            status_code=500, detail=f"Pattern extraction failed: {exc}"
+        ) from exc
 
-    logger.info("Pattern extracted: %s (id=%s)", pattern.name, pattern.pattern_id)
+    logger.info("Pattern preview generated for %s: %s", arxiv_id, pattern.name)
+    return pattern
 
-    # 3. Neo4j にパターンノードを保存
+
+@app.post("/api/patterns/register", response_model=PatternRegisterResponse)
+def register_pattern(
+    body: PatternRegisterRequest,
+    background_tasks: BackgroundTasks,
+) -> PatternRegisterResponse:
+    """ユーザーが確認・修正済みの AbstractionPattern を正式に登録する。
+
+    1. Neo4j にパターンノードを保存
+    2. Qdrant にパターンの Embedding を保存
+    3. 過去論文に対する再評価バッチをバックグラウンドでトリガー
+    """
+    pattern = body.pattern
+
+    # 1. Neo4j にパターンノードを保存
     try:
         driver = get_driver()
         with driver.session() as session:
@@ -895,12 +1053,14 @@ def _run_pattern_extraction_task(arxiv_id: str) -> None:
                 structural_rules=json.dumps(pattern.structural_rules),
                 source_arxiv_id=pattern.source_arxiv_id,
             )
-        logger.info("Pattern %s saved to Neo4j", pattern.pattern_id)
-    except Exception:
-        logger.exception("Failed to save pattern %s to Neo4j", pattern.pattern_id)
-        return
+        logger.info("Pattern %s registered in Neo4j", pattern.pattern_id)
+    except Exception as exc:
+        logger.exception("Failed to register pattern %s in Neo4j", pattern.pattern_id)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to register pattern: {exc}"
+        ) from exc
 
-    # 4. Qdrant にパターンの Embedding を保存
+    # 2. Qdrant にパターンの Embedding を保存
     try:
         client = get_client()
         settings = get_settings()
@@ -913,45 +1073,17 @@ def _run_pattern_extraction_task(arxiv_id: str) -> None:
             embedding_model=settings.embedding_model,
         )
     except Exception:
-        logger.warning("Pattern embedding failed for %s (continuing)", pattern.pattern_id, exc_info=True)
-
-    # 5. 過去の論文に対してバッチ評価
-    try:
-        matches = run_pattern_evaluation_task(pattern, _storage().client)
-        logger.info(
-            "Batch evaluation completed for pattern %s: %d matches",
-            pattern.pattern_id, len(matches),
-        )
-    except Exception:
-        logger.exception("Batch evaluation failed for pattern %s", pattern.pattern_id)
-
-
-# ---------------------------------------------------------------------------
-# Pattern API endpoints
-# ---------------------------------------------------------------------------
-
-@app.post("/api/patterns/extract/{arxiv_id}", response_model=PatternExtractAccepted)
-def extract_pattern(
-    arxiv_id: str,
-    background_tasks: BackgroundTasks,
-) -> PatternExtractAccepted:
-    """指定論文から抽象化パターンを抽出するバックグラウンドジョブを開始する。
-
-    パターン抽出後、自動的に過去論文への再評価バッチも実行される。
-    """
-    # PaperStructure が存在するか確認
-    safe_id = arxiv_id.replace("/", "_")
-    try:
-        _storage().client.stat_object("extracted-structures", f"{safe_id}.json")
-    except Exception:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No extracted structure found for '{arxiv_id}'. Extract the paper first.",
+        logger.warning(
+            "Pattern embedding failed for %s (continuing)", pattern.pattern_id, exc_info=True
         )
 
-    background_tasks.add_task(_run_pattern_extraction_task, arxiv_id)
-    logger.info("Pattern extraction job queued for %s", arxiv_id)
-    return PatternExtractAccepted(arxiv_id=arxiv_id, status="pending")
+    # 3. バックグラウンドで過去論文に対する再評価バッチをトリガー
+    background_tasks.add_task(
+        _run_pattern_evaluation_task, pattern
+    )
+
+    logger.info("Pattern %s fully registered, batch evaluation queued", pattern.pattern_id)
+    return PatternRegisterResponse(pattern_id=pattern.pattern_id, status="registered")
 
 
 @app.get("/api/patterns", response_model=PatternListResponse)
