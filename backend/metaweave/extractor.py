@@ -232,7 +232,25 @@ def _finalize_structure(state: _AnalysisState, paper_id: str) -> PaperStructure:
         f"{state_str}\n\n"
         "Based on the above, extract the final paper structure.\n"
         "Use both Japanese and English in descriptions. "
-        f'Set paper_id="{paper_id}".'
+        f'Set paper_id="{paper_id}".\n\n'
+        "=== MetaWeave-SMILES DSL Instructions ===\n"
+        "You MUST encode all extracted causal relationships (CausalEdge) and variables "
+        "into the MetaWeave-SMILES DSL and store the result in abstract_structure.smiles_dsl.\n\n"
+        "DSL syntax:\n"
+        "  [variableID:OntologyType:concreteValue] -[relationType:polarity]-> [targetVariableID:OntologyType:concreteValue]\n"
+        "Example:\n"
+        "  [a:Agent:Toyota] -[causes:+]-> [r:Resource:Profit]\n\n"
+        "Rules:\n"
+        "1. Each variable must be assigned an OntologyType from the following: "
+        "Agent, Resource, Event, Purpose-oriented group, Institutional Agent, Intentional Moment.\n"
+        "2. Each CausalEdge must specify polarity (+ or -) in both the edge's polarity field "
+        "and the DSL string.\n"
+        "3. Each CausalEdge must specify ontology_level with the relevant ontology relation type.\n"
+        "4. If there is a cycle (loop) among variables, reuse the variable ID "
+        "without repeating the full declaration (e.g., [a] instead of [a:Agent:Toyota]).\n"
+        "5. Chain multiple edges with spaces: "
+        "[a:Agent:X] -[causes:+]-> [r:Resource:Y] [r] -[inhibits:-]-> [a]\n"
+        "6. Classify all extraction targets strictly according to OntologyType.\n"
     )
 
     resp = client.beta.chat.completions.parse(

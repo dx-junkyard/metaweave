@@ -9,6 +9,17 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 
+class OntologyType(str, Enum):
+    """UFO-C / REA に基づく上位オントロジー型。"""
+
+    AGENT = "Agent"
+    RESOURCE = "Resource"
+    EVENT = "Event"
+    PURPOSE_ORIENTED_GROUP = "Purpose-oriented group"
+    INSTITUTIONAL_AGENT = "Institutional Agent"
+    INTENTIONAL_MOMENT = "Intentional Moment"
+
+
 class ReviewStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
@@ -49,6 +60,8 @@ class CausalEdge(BaseModel):
     source: str = Field(description="Source variable")
     target: str = Field(description="Target variable")
     relation: str = Field(default="causes", description="Type of relation (causes, inhibits, correlates, ...)")
+    polarity: str = Field(default="+", description="Causal polarity (+/-)")
+    ontology_level: str = Field(default="", description="Ontology relation type (e.g., Intentional Moment)")
 
 
 class AbstractStructure(BaseModel):
@@ -56,6 +69,7 @@ class AbstractStructure(BaseModel):
 
     variables: list[str] = Field(default_factory=list, description="Extracted variables / key concepts")
     edges: list[CausalEdge] = Field(default_factory=list, description="Causal or relational edges")
+    smiles_dsl: str = Field(default="", description="MetaWeave-SMILES format (e.g., [a:Agent:Organization] -[cause:+]-> [r:Resource:Profit])")
 
 
 class PaperStructure(BaseModel):
