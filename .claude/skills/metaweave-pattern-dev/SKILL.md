@@ -14,11 +14,11 @@ allowed-tools: Bash(python3 *)
 - 一時的なPythonスクリプトを生成し、対象論文から `AbstractionPattern` を抽出してください。
 - 出力されたJSONがPydanticモデル（変数テンプレート、構造ルールなど）に厳格に従っているか、またEvo-DKDの要件（汎用化されているか）を満たしているか検証し、結果をターミナルに整形して出力してください。
 
-## 2. ベクトル検索テスト (`/test-vector-search <pattern_id>`)
-Qdrantに保存されたパターンベクトルを用いて、類似する過去の論文を検索するテストを実行します。
+## 2. FANNS ハイブリッド検索テスト (`/test-fanns-search <query_regex> <query_text>`)
+Qdrantのペイロードに保存された `smiles_dsl` に対する正規表現フィルタと、ベクトル類似度検索を組み合わせたハイブリッド検索（FANNS）のテストを実行します。
 **実行時の指示:**
-- 指定された `pattern_id` のベクトルをQdrant（`patterns` コレクション）から取得し、`papers` コレクションに対して類似度検索を行う一時スクリプトを実行してください。
-- 検索結果のトップ5件（arxiv_idとスコア）をターミナルに出力し、Qdrantの接続と検索ロジックが正常に機能しているか確認してください。
+- 一時スクリプトを作成し、まず `query_regex` を用いてQdrantの `smiles_dsl` ペイロードを事前フィルタリング（Pre-filtering）してください。
+- その後、フィルタを通過したID（Candidate Set）に対して `query_text` のベクトル検索を行い、トップ5件を出力してください。構造的条件と意味的条件が両立できているか確認してください。
 
 ## 3. 再評価バッチの強制実行 (`/run-pattern-batch <pattern_id>`)
 `backend/main.py` (または `batch.py`) の `_run_pattern_evaluation_task` を強制的に同期実行します。

@@ -19,6 +19,8 @@ from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
 
+from metaweave.schema import PaperStructure
+
 logger = logging.getLogger(__name__)
 
 _COLLECTION = "papers"
@@ -52,6 +54,7 @@ def embed_and_store(
     arxiv_id: str,
     openai_client: OpenAI,
     embedding_model: str,
+    extracted_structure: PaperStructure | None = None,
 ) -> None:
     """チャンクリストを一括 Embedding して Qdrant に upsert する。
 
@@ -65,6 +68,9 @@ def embed_and_store(
         使用する OpenAI クライアント。
     embedding_model:
         Embedding モデル名（例: "text-embedding-3-large"）。
+    extracted_structure:
+        抽出済みの PaperStructure（指定時は SMILES DSL とオントロジー情報を
+        ペイロードに付与する）。
     """
     if not chunks:
         return
@@ -85,19 +91,28 @@ def embed_and_store(
 
     # 決定論的な整数 ID を生成（arxiv_id + チャンクインデックスのハッシュ）
     safe_id = arxiv_id.replace("/", "_").replace(".", "_")
+
+    # extracted_structure が指定されている場合、SMILES DSL と変数をペイロードに追加
+    extra_payload: dict = {}
+    if extracted_structure is not None:
+        extra_payload["smiles_dsl"] = extracted_structure.abstract_structure.smiles_dsl
+        extra_payload["variables"] = extracted_structure.abstract_structure.variables
+
     points: list[PointStruct] = []
     for i, vector in enumerate(all_embeddings):
         point_id = abs(hash(f"{safe_id}_{i}")) % (2**53)
+        payload = {
+            "arxiv_id": arxiv_id,
+            "chunk_index": i,
+            # Qdrant ペイロードには先頭 500 文字のみ保存（コスト削減）
+            "text": chunks[i][:500],
+            **extra_payload,
+        }
         points.append(
             PointStruct(
                 id=point_id,
                 vector=vector,
-                payload={
-                    "arxiv_id": arxiv_id,
-                    "chunk_index": i,
-                    # Qdrant ペイロードには先頭 500 文字のみ保存（コスト削減）
-                    "text": chunks[i][:500],
-                },
+                payload=payload,
             )
         )
 
@@ -210,3 +225,39 @@ def search_similar_papers(
     # スコア降順でソートし、上位 top_k 件を返す
     ranked = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
     return ranked[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# FANNS (Filtered ANNS) hybrid search
+# ---------------------------------------------------------------------------
+
+def search_fanns_hybrid(
+    query_regex: str,
+    query_text: str,
+    top_k: int = 5,
+) -> list[dict]:
+    """Filtered ANNS によるハイブリッド検索の基盤関数。
+
+    処理フロー:
+    1. ``query_regex`` による DB（または Qdrant ペイロード）の事前フィルタリング
+       （Pre-filtering）を行い、候補ポイント ID を絞り込む。
+    2. 絞り込まれた ID をメタデータフィルタとして ``query_text`` のベクトル検索
+       （Filtered ANNS）を実行し、意味的類似度でランキングする。
+
+    Parameters
+    ----------
+    query_regex:
+        Pre-filtering 用の正規表現パターン。SMILES DSL やオントロジー型に対して
+        マッチングを行い、検索空間を事前に絞り込む。
+    query_text:
+        ベクトル検索用のクエリテキスト。Embedding 後にフィルタ済み候補に対して
+        コサイン類似度検索を行う。
+    top_k:
+        返却する上位件数。
+
+    Returns
+    -------
+    list[dict]
+        検索結果のリスト（詳細は実装時に確定）。
+    """
+    raise NotImplementedError("FANNS hybrid search is not yet implemented.")
