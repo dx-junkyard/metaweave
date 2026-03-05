@@ -57,6 +57,12 @@ if "username" not in st.session_state:
 # 提案中の論文: arxiv_id -> proposal_id (直近に送信した提案を追跡)
 if "pending_proposals" not in st.session_state:
     st.session_state.pending_proposals: dict[str, str] = {}
+# ドラフトが存在する論文を追跡: arxiv_id -> True
+if "draft_papers" not in st.session_state:
+    st.session_state.draft_papers: dict[str, bool] = {}
+# パターンプレビュー結果: arxiv_id -> pattern dict
+if "pattern_preview" not in st.session_state:
+    st.session_state.pattern_preview: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -82,12 +88,23 @@ def _poll_processing_papers() -> None:
         status = status_data.get("status", "")
 
         if status == "completed":
-            # 構造を自動ロード
+            # 構造を自動ロード: まずドラフトを試行、なければ正典
+            _loaded_from_draft = False
             try:
-                result = api_get_extract_result(arxiv_id)
-                st.session_state.structures[arxiv_id] = result
+                _draft = api_get_draft(arxiv_id)
+                if _draft is not None:
+                    st.session_state.structures[arxiv_id] = _draft["structure"]
+                    st.session_state.draft_papers[arxiv_id] = True
+                    _loaded_from_draft = True
             except Exception:
                 pass
+            if not _loaded_from_draft:
+                try:
+                    result = api_get_extract_result(arxiv_id)
+                    st.session_state.structures[arxiv_id] = result
+                    st.session_state.draft_papers.pop(arxiv_id, None)
+                except Exception:
+                    pass
             title = info.get("title", arxiv_id)
             del st.session_state.processing_papers[arxiv_id]
             st.toast(f"解析が完了しました！", icon="✅")
@@ -153,11 +170,17 @@ def api_list_papers() -> list[str]:
     return resp.json()
 
 
-def api_extract(object_name: str, arxiv_id: str) -> dict:
+def api_extract(
+    object_name: str, arxiv_id: str, is_draft: bool = False, user_id: str | None = None
+) -> dict:
     """POST /api/extract — submit async job, returns {arxiv_id, status: "pending"}."""
+    payload: dict = {"object_name": object_name, "arxiv_id": arxiv_id}
+    if is_draft:
+        payload["is_draft"] = True
+        payload["user_id"] = user_id
     resp = requests.post(
         f"{BACKEND_URL}/api/extract",
-        json={"object_name": object_name, "arxiv_id": arxiv_id},
+        json=payload,
         headers=_auth_headers(),
         timeout=30,
     )
@@ -253,11 +276,11 @@ def api_get_proposals(arxiv_id: str) -> dict:
 
 
 def api_extract_pattern(arxiv_id: str) -> dict:
-    """POST /api/patterns/extract/{arxiv_id} — trigger pattern extraction."""
+    """POST /api/patterns/extract/{arxiv_id} — preview pattern extraction (synchronous)."""
     resp = requests.post(
         f"{BACKEND_URL}/api/patterns/extract/{arxiv_id}",
         headers=_auth_headers(),
-        timeout=30,
+        timeout=120,
     )
     resp.raise_for_status()
     return resp.json()
@@ -283,6 +306,46 @@ def api_get_paper_patterns(arxiv_id: str) -> list[dict]:
     )
     resp.raise_for_status()
     return resp.json().get("matches", [])
+
+
+def api_get_draft(arxiv_id: str) -> dict | None:
+    """GET /api/draft/{arxiv_id} — fetch user's private draft from Neo4j.
+
+    Returns the draft structure dict, or None if no draft exists (404).
+    """
+    resp = requests.get(
+        f"{BACKEND_URL}/api/draft/{arxiv_id}",
+        headers=_auth_headers(),
+        timeout=15,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()  # {arxiv_id, structure: {...}}
+
+
+def api_save_draft(arxiv_id: str, structure: dict) -> dict:
+    """PUT /api/draft/{arxiv_id} — save structure as user's private draft."""
+    resp = requests.put(
+        f"{BACKEND_URL}/api/draft/{arxiv_id}",
+        json={"structure": structure},
+        headers=_auth_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def api_register_pattern(pattern: dict) -> dict:
+    """POST /api/patterns/register — register a confirmed pattern to Qdrant/Neo4j."""
+    resp = requests.post(
+        f"{BACKEND_URL}/api/patterns/register",
+        json={"pattern": pattern},
+        headers=_auth_headers(),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()  # {pattern_id, status: "registered"}
 
 
 def _auth_post(path: str, payload: dict) -> dict:
@@ -592,17 +655,28 @@ elif page == "Validation View":
             object_name = stored[active_id]
             is_processing = active_id in st.session_state.processing_papers
 
-            # 処理中の場合は最新の構造を自動リロード
-            if active_id in st.session_state.structures:
-                s = st.session_state.structures[active_id]
-            else:
-                # MinIO から取得を試みる（完了済みかもしれない）
+            # ── ドラフト優先ロジック: まずユーザーのドラフトを取得、なければ正典を取得
+            _is_draft_view = False
+            if active_id not in st.session_state.structures:
+                # ドラフトを試行
                 try:
-                    _loaded = api_get_extract_result(active_id)
-                    st.session_state.structures[active_id] = _loaded
-                    s = _loaded
+                    _draft_resp = api_get_draft(active_id)
+                    if _draft_resp is not None:
+                        st.session_state.structures[active_id] = _draft_resp["structure"]
+                        st.session_state.draft_papers[active_id] = True
                 except Exception:
-                    s = _empty_structure(active_id)
+                    pass
+                # ドラフトがなければ MinIO の正典を取得
+                if active_id not in st.session_state.structures:
+                    try:
+                        _loaded = api_get_extract_result(active_id)
+                        st.session_state.structures[active_id] = _loaded
+                        st.session_state.draft_papers.pop(active_id, None)
+                    except Exception:
+                        st.session_state.structures[active_id] = _empty_structure(active_id)
+
+            s = st.session_state.structures[active_id]
+            _is_draft_view = st.session_state.draft_papers.get(active_id, False)
 
             status = s.get("review_status", "pending")
             title = (
@@ -617,9 +691,18 @@ elif page == "Validation View":
                 st.info("バックグラウンドで解析処理中です。完了次第自動的に更新されます。")
             else:
                 st.title(title)
-            st.caption(
-                f"arXiv ID: `{active_id}`  |  Status: {_STATUS_LABEL.get(status, '🟡 Pending')}"
-            )
+
+            # ── ドラフト / 正典バッジ ────────────────────────────────────────
+            _badge_col, _status_col = st.columns([1, 3])
+            with _badge_col:
+                if _is_draft_view:
+                    st.info("📝 あなたの未公開ドラフト")
+                else:
+                    st.success("🏛️ システム正規テンプレート")
+            with _status_col:
+                st.caption(
+                    f"arXiv ID: `{active_id}`  |  Status: {_STATUS_LABEL.get(status, '🟡 Pending')}"
+                )
 
             # ── Action buttons (right-aligned) ───────────────────────────────
             _, act1, act2, act3, act4 = st.columns([5, 1, 1, 1, 1])
@@ -644,22 +727,30 @@ elif page == "Validation View":
             with act3:
                 if st.button("🔄 Re-Extract", use_container_width=True, key="btn_reextract"):
                     try:
-                        api_extract(object_name, active_id)
+                        api_extract(
+                            object_name,
+                            active_id,
+                            is_draft=True,
+                            user_id=st.session_state.user_id,
+                        )
                         st.session_state.processing_papers[active_id] = {
                             "title": title,
                             "object_name": object_name,
                         }
-                        st.toast(f"⏳ 「{title}」 の再解析を開始しました")
+                        st.toast(f"⏳ 「{title}」 の再解析を開始しました（ドラフトとして保存されます）")
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Re-extraction failed: {exc}")
             with act4:
                 if st.button("✨ Pattern", use_container_width=True, key="btn_pattern"):
                     try:
-                        api_extract_pattern(active_id)
-                        st.toast("✨ 抽象化パターンの抽出を開始しました")
+                        with st.spinner("パターンを抽出中…"):
+                            _preview = api_extract_pattern(active_id)
+                            st.session_state.pattern_preview[active_id] = _preview
+                        st.rerun()
                     except Exception as exc:
                         st.error(f"Pattern extraction failed: {exc}")
+            # 💾 Save edits is inside the structure editor form below
 
             st.divider()
 
@@ -782,13 +873,21 @@ elif page == "Validation View":
                                 height=110,
                             )
 
-                        propose = st.form_submit_button(
-                            "💡 変更を提案する (Propose)",
-                            use_container_width=True,
-                            type="primary",
-                        )
+                        _btn_col1, _btn_col2 = st.columns(2)
+                        with _btn_col1:
+                            save_draft_btn = st.form_submit_button(
+                                "💾 Save edits",
+                                use_container_width=True,
+                            )
+                        with _btn_col2:
+                            propose = st.form_submit_button(
+                                "💡 変更を提案する (Propose)",
+                                use_container_width=True,
+                                type="primary",
+                            )
 
-                    if propose:
+                    # ── フォーム送信後の共通処理: 編集内容を dict に変換 ────
+                    if save_draft_btn or propose:
                         try:
                             edges_parsed = json.loads(edges_json)
                         except Exception:
@@ -825,6 +924,16 @@ elif page == "Validation View":
                         }
                         st.session_state.structures[active_id] = updated
 
+                    if save_draft_btn:
+                        # ドラフトとして Neo4j に保存
+                        try:
+                            api_save_draft(active_id, updated)
+                            st.session_state.draft_papers[active_id] = True
+                            st.toast("ドラフトを保存しました", icon="💾")
+                        except Exception as exc:
+                            st.error(f"ドラフトの保存に失敗しました: {exc}")
+
+                    if propose:
                         # LLM Gateway へ提案を送信
                         try:
                             result = api_propose_structure(active_id, updated)
@@ -836,6 +945,87 @@ elif page == "Validation View":
                             )
                         except Exception as exc:
                             st.error(f"提案の送信に失敗しました: {exc}")
+
+                    # ── パターンプレビュー表示 ──────────────────────────────
+                    _preview_data = st.session_state.pattern_preview.get(active_id)
+                    if _preview_data:
+                        st.divider()
+                        st.markdown("### ✨ パターン抽出プレビュー")
+                        st.caption(
+                            "抽出された抽象化パターンを確認・編集できます。"
+                            "内容に納得したら「🌍 正式登録」ボタンで共有知として登録してください。"
+                        )
+                        with st.expander("パターンプレビュー", expanded=True):
+                            _pv_name = st.text_input(
+                                "パターン名",
+                                value=_preview_data.get("name", ""),
+                                key="pv_name",
+                            )
+                            _pv_desc = st.text_area(
+                                "説明",
+                                value=_preview_data.get("description", ""),
+                                height=100,
+                                key="pv_desc",
+                            )
+                            _pv_vars_raw = _preview_data.get("variables_template", [])
+                            _pv_vars = st.text_area(
+                                "変数テンプレート (1行1変数)",
+                                value="\n".join(_pv_vars_raw),
+                                height=80,
+                                key="pv_vars",
+                            )
+                            _pv_rules_raw = _preview_data.get("structural_rules", [])
+                            _pv_rules = st.text_area(
+                                "構造ルール (1行1ルール)",
+                                value="\n".join(_pv_rules_raw),
+                                height=100,
+                                key="pv_rules",
+                            )
+
+                            _reg_col, _cancel_col = st.columns(2)
+                            with _reg_col:
+                                if st.button(
+                                    "🌍 このパターンをシステムに正式登録する",
+                                    use_container_width=True,
+                                    type="primary",
+                                    key="btn_register_pattern",
+                                ):
+                                    _edited_pattern = {
+                                        "pattern_id": _preview_data.get("pattern_id", ""),
+                                        "name": _pv_name,
+                                        "description": _pv_desc,
+                                        "variables_template": [
+                                            v.strip()
+                                            for v in _pv_vars.splitlines()
+                                            if v.strip()
+                                        ],
+                                        "structural_rules": [
+                                            r.strip()
+                                            for r in _pv_rules.splitlines()
+                                            if r.strip()
+                                        ],
+                                        "source_arxiv_id": _preview_data.get(
+                                            "source_arxiv_id", active_id
+                                        ),
+                                    }
+                                    try:
+                                        _reg_resp = api_register_pattern(_edited_pattern)
+                                        st.session_state.pattern_preview.pop(active_id, None)
+                                        st.toast(
+                                            f"パターンを正式登録しました (ID: {_reg_resp.get('pattern_id', '')[:8]}…)",
+                                            icon="🌍",
+                                        )
+                                        st.rerun()
+                                    except Exception as exc:
+                                        st.error(f"パターンの登録に失敗しました: {exc}")
+                            with _cancel_col:
+                                if st.button(
+                                    "❌ キャンセル",
+                                    use_container_width=True,
+                                    key="btn_cancel_pattern",
+                                ):
+                                    st.session_state.pattern_preview.pop(active_id, None)
+                                    st.rerun()
 
                 # ── Chat tab ──────────────────────────────────────────────────
                 with chat_tab:
