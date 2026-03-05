@@ -131,6 +131,7 @@ class ExtractRequest(BaseModel):
     arxiv_id: str
     is_draft: bool = False
     user_id: str | None = None
+    skip_embedding: bool = False
 
 
 class ExtractAccepted(BaseModel):
@@ -339,12 +340,13 @@ def _run_extraction_task(
     arxiv_id: str,
     is_draft: bool = False,
     user_id: str | None = None,
+    skip_embedding: bool = False,
 ) -> None:
     """バックグラウンドで実行される抽出タスク。
 
     1. ステータスを "processing" に更新
     2. MinIO から PDF を取得
-    3. テキスト抽出 → 仮説検証型チャンク解析 → Embedding（並行）
+    3. テキスト抽出 → 仮説検証型チャンク解析 → Embedding（並行、skip_embedding=False の場合）
     4. is_draft=False の場合は MinIO に保存（従来どおり）、
        is_draft=True の場合は Neo4j のユーザードラフトとして保存
     5. ステータスを "completed" または "failed" に更新
@@ -354,15 +356,18 @@ def _run_extraction_task(
 
     try:
         # 1. Fetch PDF from MinIO
-        logger.info("Background extraction started for %s (is_draft=%s)", arxiv_id, is_draft)
+        logger.info(
+            "Background extraction started for %s (is_draft=%s, skip_embedding=%s)",
+            arxiv_id, is_draft, skip_embedding,
+        )
         response = _storage().client.get_object("raw-papers", object_name)
         pdf_bytes = response.read()
         response.close()
         response.release_conn()
 
-        # 2. Extract text and structure (includes concurrent embedding)
+        # 2. Extract text and structure (Embedding は skip_embedding=False の場合のみ実行)
         text = ext.extract_text_from_pdf_bytes(pdf_bytes)
-        structure = ext.extract_paper_structure(text, paper_id=arxiv_id)
+        structure = ext.extract_paper_structure(text, paper_id=arxiv_id, skip_embedding=skip_embedding)
 
         if is_draft and user_id:
             # 3a. ドラフトモード: Neo4j のユーザードラフトとして保存
@@ -483,14 +488,20 @@ def extract(body: ExtractRequest, background_tasks: BackgroundTasks) -> ExtractA
         _job_status[body.arxiv_id] = ExtractJobStatus(
             arxiv_id=body.arxiv_id, status="pending"
         )
+    # Re-Extract（is_draft=True）の場合は Qdrant チャンクが既存のためスキップ
+    effective_skip_embedding = body.skip_embedding or body.is_draft
     background_tasks.add_task(
         _run_extraction_task,
         body.object_name,
         body.arxiv_id,
         is_draft=body.is_draft,
         user_id=body.user_id,
+        skip_embedding=effective_skip_embedding,
     )
-    logger.info("Extraction job queued for %s (is_draft=%s)", body.arxiv_id, body.is_draft)
+    logger.info(
+        "Extraction job queued for %s (is_draft=%s, skip_embedding=%s)",
+        body.arxiv_id, body.is_draft, effective_skip_embedding,
+    )
     return ExtractAccepted(arxiv_id=body.arxiv_id, status="pending")
 
 

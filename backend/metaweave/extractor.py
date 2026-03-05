@@ -280,23 +280,33 @@ def _embed_and_store_chunks(chunks: list[str], paper_id: str) -> None:
 # Public: メイン抽出関数
 # ---------------------------------------------------------------------------
 
-def extract_paper_structure(text: str, paper_id: str = "") -> PaperStructure:
+def extract_paper_structure(
+    text: str, paper_id: str = "", skip_embedding: bool = False
+) -> PaperStructure:
     """仮説検証型の逐次処理で論文テキストから PaperStructure を抽出する。
 
     処理フロー:
     1. テキストをチャンク分割
-    2. Embedding を ThreadPoolExecutor でバックグラウンド並行実行
+    2. skip_embedding=False の場合のみ Embedding を ThreadPoolExecutor でバックグラウンド並行実行
     3. 最初のチャンクから初期仮説ドラフトを生成
     4. 2番目以降のチャンクで逐次精錬（状態を更新）
     5. 最終評価で PaperStructure を出力
-    6. Embedding 完了を待機（最大 90 秒）
+    6. skip_embedding=False の場合のみ Embedding 完了を待機（最大 90 秒）
+
+    Parameters
+    ----------
+    skip_embedding:
+        True の場合、Qdrant への Embedding 処理を完全にスキップする。
+        Re-Extract（ドラフト再生成）など、すでにチャンクが保存済みの場合に使用する。
     """
     chunks = chunk_text(text)
-    logger.info("paper=%s  total_chunks=%d", paper_id, len(chunks))
+    logger.info("paper=%s  total_chunks=%d  skip_embedding=%s", paper_id, len(chunks), skip_embedding)
 
-    # Embedding をバックグラウンドで並行実行
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    embed_future = executor.submit(_embed_and_store_chunks, chunks, paper_id)
+    embed_future: concurrent.futures.Future | None = None
+
+    if not skip_embedding:
+        embed_future = executor.submit(_embed_and_store_chunks, chunks, paper_id)
 
     try:
         # Step 1: 初期仮説生成（最初のチャンク）
@@ -323,11 +333,14 @@ def extract_paper_structure(text: str, paper_id: str = "") -> PaperStructure:
 
     finally:
         # Embedding の完了を待つ（最大 90 秒、失敗しても続行）
-        try:
-            embed_future.result(timeout=90)
-            logger.info("Embedding completed for %s", paper_id)
-        except Exception:
-            logger.warning("Embedding future failed for %s", paper_id, exc_info=True)
+        if embed_future is not None:
+            try:
+                embed_future.result(timeout=90)
+                logger.info("Embedding completed for %s", paper_id)
+            except Exception:
+                logger.warning("Embedding future failed for %s", paper_id, exc_info=True)
+        else:
+            logger.info("Embedding skipped for %s (skip_embedding=True)", paper_id)
         executor.shutdown(wait=False)
 
     return structure
