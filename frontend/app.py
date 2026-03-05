@@ -448,6 +448,7 @@ def _empty_structure(paper_id: str) -> dict:
         "methodology": {"approach": "", "techniques": []},
         "constraints": {"assumptions": [], "limitations": []},
         "abstract_structure": {
+            "smiles_dsl": "",
             "variables": [],
             "edges": [],
         },
@@ -856,6 +857,11 @@ elif page == "Validation View":
 
                         with tab3:
                             st.markdown("#### Abstract Structure")
+                            smiles_dsl = st.text_area(
+                                "MetaWeave-SMILES DSL",
+                                value=s["abstract_structure"].get("smiles_dsl", ""),
+                                height=80,
+                            )
                             variables = st.text_area(
                                 "Variables (one per line)",
                                 value="\n".join(s["abstract_structure"]["variables"]),
@@ -914,6 +920,7 @@ elif page == "Validation View":
                                 ],
                             },
                             "abstract_structure": {
+                                "smiles_dsl": smiles_dsl,
                                 "variables": [
                                     v.strip() for v in variables.splitlines() if v.strip()
                                 ],
