@@ -1,10 +1,12 @@
 """PDF text extraction and hypothesis-driven sequential LLM structure extraction.
 
-Architecture (仮説検証型チャンク解析):
-1. Chunk:      Split text by paragraph/section boundaries into ~4 000-char chunks.
-2. Hypothesis: Send first chunk (Abstract etc.) to LLM → initial draft.
-3. Refine:     Process each subsequent chunk, updating accumulated state.
-4. Finalize:   Produce final PaperStructure from the accumulated state.
+Architecture (GROBID ベース構造事前マッピング):
+1. GROBID:     PDF を GROBID API に送信し TEI XML を取得。
+2. Parse:      XML から論理セクション（Abstract / Body の <div>）を抽出。
+               References・Acknowledgments は除外。
+3. Hypothesis: 最初のセクション（Abstract 等）から初期仮説を生成。
+4. Refine:     後続セクションで逐次精錬。
+5. Finalize:   最終 PaperStructure を出力。
 
 Embedding runs concurrently in a background thread using ThreadPoolExecutor.
 
@@ -23,20 +25,25 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
-import fitz  # PyMuPDF
+import requests
+from bs4 import BeautifulSoup, Tag
 
 from metaweave.llm import get_client, get_settings
 from metaweave.schema import AbstractionPattern, MergeResult, PaperStructure
 
 logger = logging.getLogger(__name__)
 
-# チャンクサイズ設定
-_CHUNK_SIZE = 4_000   # 1チャンクあたりの目標文字数
-_MIN_CHUNK = 500      # これ以下はフラッシュしない最小文字数
+# GROBID 接続先（docker-compose で GROBID_URL 環境変数として注入）
+_GROBID_URL = os.environ.get("GROBID_URL", "http://localhost:8070")
+
+# セクション分割フォールバック用の閾値
+_MAX_SECTION_CHARS = 8_000
+_FALLBACK_CHUNK_SIZE = 4_000
 
 
 # ---------------------------------------------------------------------------
@@ -56,27 +63,137 @@ class _AnalysisState:
 
 
 # ---------------------------------------------------------------------------
-# Public: PDF テキスト抽出
+# Public: GROBID API を使った PDF → TEI XML 変換
 # ---------------------------------------------------------------------------
+
+def extract_tei_xml_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """PDF バイナリを GROBID の processFulltextDocument API に送信し TEI XML を返す。"""
+    url = f"{_GROBID_URL}/api/processFulltextDocument"
+    resp = requests.post(
+        url,
+        files={"input": ("paper.pdf", pdf_bytes, "application/pdf")},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
+def _split_long_section(text: str, max_len: int = _MAX_SECTION_CHARS) -> list[str]:
+    """長すぎるセクションをセンテンス境界で分割するフォールバック。"""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    current: list[str] = []
+    current_len = 0
+    for sent in sentences:
+        if current_len + len(sent) > _FALLBACK_CHUNK_SIZE and current_len > 0:
+            chunks.append(" ".join(current))
+            current = []
+            current_len = 0
+        current.append(sent)
+        current_len += len(sent)
+    if current:
+        chunks.append(" ".join(current))
+    return chunks or [text[:_FALLBACK_CHUNK_SIZE]]
+
+
+# ---------------------------------------------------------------------------
+# Public: TEI XML → 論理チャンク（セクション単位）
+# ---------------------------------------------------------------------------
+
+_EXCLUDED_HEADINGS = re.compile(
+    r"(references?|bibliography|acknowledgm|funding|competing\s+interest)",
+    re.IGNORECASE,
+)
+
+
+def parse_tei_to_logical_chunks(tei_xml: str) -> list[str]:
+    """GROBID が返す TEI XML を解析し、セクション単位の論理チャンクを返す。
+
+    - ``<teiHeader>`` 内の Abstract を最初のチャンクとして取得。
+    - ``<text><body>`` 内の各 ``<div>`` を 1 セクション = 1 チャンクとして抽出。
+    - ``<back>`` / ``<listBibl>``（References）や Acknowledgments は除外。
+    - 8 000 文字を超えるセクションはセンテンス境界でさらに分割。
+    """
+    soup = BeautifulSoup(tei_xml, "xml")
+    chunks: list[str] = []
+
+    # --- Abstract の抽出 ---
+    abstract_tag = soup.find("abstract")
+    if abstract_tag:
+        abstract_text = abstract_tag.get_text(separator=" ", strip=True)
+        if abstract_text:
+            chunks.append(f"[Abstract]\n{abstract_text}")
+
+    # --- Body セクションの抽出 ---
+    body = soup.find("body")
+    if body:
+        for div in body.find_all("div", recursive=False):
+            head_tag = div.find("head")
+            heading = head_tag.get_text(strip=True) if head_tag else ""
+
+            # References / Acknowledgments を除外
+            if heading and _EXCLUDED_HEADINGS.search(heading):
+                continue
+
+            paragraphs: list[str] = []
+            for p_tag in div.find_all("p"):
+                p_text = p_tag.get_text(separator=" ", strip=True)
+                if p_text:
+                    paragraphs.append(p_text)
+
+            if not paragraphs:
+                continue
+
+            section_text = (
+                f"[{heading}]\n" + "\n".join(paragraphs)
+                if heading
+                else "\n".join(paragraphs)
+            )
+
+            # 長いセクションはフォールバック分割
+            chunks.extend(_split_long_section(section_text))
+
+    if not chunks:
+        # XML パースで何も取れなかった場合: テキスト全体をフォールバック
+        fallback = soup.get_text(separator=" ", strip=True)
+        if fallback:
+            chunks = _split_long_section(fallback)
+
+    return chunks or [""]
+
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """PyMuPDF を使って PDF バイナリからテキストを抽出する。"""
-    parts: list[str] = []
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        for page in doc:
-            parts.append(page.get_text())
-    return "\n".join(parts)
+    """後方互換: PDF バイナリからプレーンテキストを返す。
+
+    内部で GROBID API を呼び出し、TEI XML からテキストを抽出する。
+    GROBID 未起動などでエラーが発生した場合は PyMuPDF へフォールバックする。
+    """
+    try:
+        tei_xml = extract_tei_xml_from_pdf_bytes(pdf_bytes)
+        chunks = parse_tei_to_logical_chunks(tei_xml)
+        return "\n\n".join(chunks)
+    except Exception:
+        logger.warning(
+            "GROBID extraction failed, falling back to PyMuPDF",
+            exc_info=True,
+        )
+        import fitz  # PyMuPDF — フォールバック用に遅延 import
+
+        parts: list[str] = []
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            for page in doc:
+                parts.append(page.get_text())
+        return "\n".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Public: チャンク分割
-# ---------------------------------------------------------------------------
+def chunk_text(text: str, chunk_size: int = _FALLBACK_CHUNK_SIZE) -> list[str]:
+    """後方互換: テキストをチャンク分割する。
 
-def chunk_text(text: str, chunk_size: int = _CHUNK_SIZE) -> list[str]:
-    """段落・セクション区切りを考慮してテキストをチャンクに分割する。
-
-    2つ以上の改行で段落を区切り、チャンクサイズを超えた場合はフラッシュする。
-    1段落が chunk_size を超える場合はセンテンス単位でさらに分割する。
+    GROBID ベースの論理チャンク生成（parse_tei_to_logical_chunks）を優先して
+    使用するため、この関数は extract_paper_structure のフォールバック経路のみで使用。
     """
     paragraphs = re.split(r"\n{2,}", text)
     chunks: list[str] = []
@@ -89,19 +206,17 @@ def chunk_text(text: str, chunk_size: int = _CHUNK_SIZE) -> list[str]:
             continue
         para_len = len(para)
 
-        # チャンクサイズを超えた場合はフラッシュ
-        if current_len + para_len > chunk_size and current_len >= _MIN_CHUNK:
+        if current_len + para_len > chunk_size and current_len >= 500:
             chunks.append("\n\n".join(current))
             current = []
             current_len = 0
 
-        # 1段落が chunk_size を超える場合はセンテンス単位でさらに分割
         if para_len > chunk_size:
             sentences = re.split(r"(?<=[.!?])\s+", para)
             sub: list[str] = []
             sub_len = 0
             for sent in sentences:
-                if sub_len + len(sent) > chunk_size and sub_len >= _MIN_CHUNK:
+                if sub_len + len(sent) > chunk_size and sub_len >= 500:
                     combined = ("\n\n".join(current) + "\n" if current else "") + " ".join(sub)
                     chunks.append(combined.strip())
                     current = []
@@ -121,8 +236,7 @@ def chunk_text(text: str, chunk_size: int = _CHUNK_SIZE) -> list[str]:
     if current:
         chunks.append("\n\n".join(current))
 
-    # フォールバック: チャンクが生成されなかった場合
-    return chunks or [text[:_CHUNK_SIZE]]
+    return chunks or [text[:chunk_size]]
 
 
 # ---------------------------------------------------------------------------
@@ -281,13 +395,17 @@ def _embed_and_store_chunks(chunks: list[str], paper_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def extract_paper_structure(
-    text: str, paper_id: str = "", skip_embedding: bool = False
+    text: str,
+    paper_id: str = "",
+    skip_embedding: bool = False,
+    pdf_bytes: bytes | None = None,
 ) -> PaperStructure:
     """仮説検証型の逐次処理で論文テキストから PaperStructure を抽出する。
 
     処理フロー:
-    1. テキストをチャンク分割
-    2. skip_embedding=False の場合のみ Embedding を ThreadPoolExecutor でバックグラウンド並行実行
+    1. pdf_bytes が渡された場合 → GROBID API で論理チャンク（セクション単位）を生成。
+       pdf_bytes が None の場合 → 従来の text ベースチャンク分割（フォールバック）。
+    2. skip_embedding=False の場合のみ Embedding をバックグラウンド並行実行
     3. 最初のチャンクから初期仮説ドラフトを生成
     4. 2番目以降のチャンクで逐次精錬（状態を更新）
     5. 最終評価で PaperStructure を出力
@@ -295,11 +413,29 @@ def extract_paper_structure(
 
     Parameters
     ----------
+    text:
+        フォールバック用のプレーンテキスト。pdf_bytes が None の場合に使用。
+    pdf_bytes:
+        元の PDF バイナリ。渡された場合は GROBID で論理チャンクを生成する。
     skip_embedding:
         True の場合、Qdrant への Embedding 処理を完全にスキップする。
-        Re-Extract（ドラフト再生成）など、すでにチャンクが保存済みの場合に使用する。
     """
-    chunks = chunk_text(text)
+    # GROBID ベースの論理チャンク生成を優先
+    if pdf_bytes is not None:
+        try:
+            tei_xml = extract_tei_xml_from_pdf_bytes(pdf_bytes)
+            chunks = parse_tei_to_logical_chunks(tei_xml)
+            logger.info("GROBID logical chunks generated: %d sections", len(chunks))
+        except Exception:
+            logger.warning(
+                "GROBID failed for %s, falling back to text chunking",
+                paper_id,
+                exc_info=True,
+            )
+            chunks = chunk_text(text)
+    else:
+        chunks = chunk_text(text)
+
     logger.info("paper=%s  total_chunks=%d  skip_embedding=%s", paper_id, len(chunks), skip_embedding)
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
