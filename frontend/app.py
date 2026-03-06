@@ -25,7 +25,7 @@ from streamlit_autorefresh import st_autorefresh
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000").rstrip("/")
 
-st.set_page_config(page_title="MetaWeave v1", layout="wide")
+st.set_page_config(page_title="MetaWeave v1", layout="wide", initial_sidebar_state="collapsed")
 
 # ---------------------------------------------------------------------------
 # Session-state defaults
@@ -803,9 +803,17 @@ elif page == "Validation View":
                         )
 
                     with st.form(f"structure_form_{active_id}"):
-                        tab1, tab2, tab3 = st.tabs(
-                            ["Problem / Hypothesis", "Method / Constraints", "Abstract / Notes"]
+                        tab_dsl, tab1, tab2, tab3 = st.tabs(
+                            ["🧬 SMILES DSL", "Problem / Hypothesis", "Method / Constraints", "Raw Variables & Edges"]
                         )
+
+                        with tab_dsl:
+                            st.markdown("#### Abstract Structure — SMILES DSL")
+                            smiles_dsl = st.text_area(
+                                "MetaWeave-SMILES DSL",
+                                value=s["abstract_structure"].get("smiles_dsl", ""),
+                                height=200,
+                            )
 
                         with tab1:
                             st.markdown("#### Problem Statement")
@@ -856,12 +864,7 @@ elif page == "Validation View":
                             )
 
                         with tab3:
-                            st.markdown("#### Abstract Structure")
-                            smiles_dsl = st.text_area(
-                                "MetaWeave-SMILES DSL",
-                                value=s["abstract_structure"].get("smiles_dsl", ""),
-                                height=80,
-                            )
+                            st.markdown("#### Raw Variables & Edges")
                             variables = st.text_area(
                                 "Variables (one per line)",
                                 value="\n".join(s["abstract_structure"]["variables"]),
@@ -869,7 +872,7 @@ elif page == "Validation View":
                             )
                             edges_json = st.text_area(
                                 "Edges (JSON list)",
-                                value=json.dumps(s["abstract_structure"]["edges"], indent=2),
+                                value=json.dumps(s["abstract_structure"]["edges"], indent=2, ensure_ascii=False),
                                 height=150,
                             )
                             st.markdown("#### Reviewer Notes")
