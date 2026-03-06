@@ -53,17 +53,11 @@ services:
       - metaweave
 
   grobid:
-    image: lfoppiano/grobid:0.8.0
+    image: lfoppiano/grobid:0.8.2
     ports:
       - "8070:8070"
     environment:
       JAVA_OPTS: "-Xmx2g -Xms512m"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8070/api/isalive"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
     networks:
       - metaweave
 
@@ -100,7 +94,7 @@ services:
       minio:
         condition: service_healthy
       grobid:
-        condition: service_healthy
+        condition: service_started
     networks:
       - metaweave
     restart: on-failure
