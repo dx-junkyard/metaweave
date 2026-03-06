@@ -366,8 +366,11 @@ def _run_extraction_task(
         response.release_conn()
 
         # 2. Extract text and structure (Embedding は skip_embedding=False の場合のみ実行)
+        #    GROBID ベースの論理チャンク生成を優先し、失敗時は text フォールバック
         text = ext.extract_text_from_pdf_bytes(pdf_bytes)
-        structure = ext.extract_paper_structure(text, paper_id=arxiv_id, skip_embedding=skip_embedding)
+        structure = ext.extract_paper_structure(
+            text, paper_id=arxiv_id, skip_embedding=skip_embedding, pdf_bytes=pdf_bytes,
+        )
 
         if is_draft and user_id:
             # 3a. ドラフトモード: Neo4j のユーザードラフトとして保存
