@@ -4,8 +4,20 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Optional
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
+
+
+class OntologyType(str, Enum):
+    """UFO-C / REA に基づく上位オントロジー型。"""
+
+    AGENT = "Agent"
+    RESOURCE = "Resource"
+    EVENT = "Event"
+    PURPOSE_ORIENTED_GROUP = "Purpose-oriented group"
+    INSTITUTIONAL_AGENT = "Institutional Agent"
+    INTENTIONAL_MOMENT = "Intentional Moment"
 
 
 class ReviewStatus(str, Enum):
@@ -48,6 +60,8 @@ class CausalEdge(BaseModel):
     source: str = Field(description="Source variable")
     target: str = Field(description="Target variable")
     relation: str = Field(default="causes", description="Type of relation (causes, inhibits, correlates, ...)")
+    polarity: str = Field(default="+", description="Causal polarity (+/-)")
+    ontology_level: str = Field(default="", description="Ontology relation type (e.g., Intentional Moment)")
 
 
 class AbstractStructure(BaseModel):
@@ -55,6 +69,7 @@ class AbstractStructure(BaseModel):
 
     variables: list[str] = Field(default_factory=list, description="Extracted variables / key concepts")
     edges: list[CausalEdge] = Field(default_factory=list, description="Causal or relational edges")
+    smiles_dsl: str = Field(default="", description="MetaWeave-SMILES format (e.g., [a:Agent:Organization] -[cause:+]-> [r:Resource:Profit])")
 
 
 class PaperStructure(BaseModel):
@@ -91,6 +106,58 @@ class StructureProposal(BaseModel):
     user_id: str = Field(description="ID of the proposing user")
     proposed_structure: PaperStructure = Field(description="The proposed PaperStructure")
     status: ReviewStatus = Field(default=ReviewStatus.PENDING, description="Review status of the proposal")
+
+
+# ---------------------------------------------------------------------------
+# LLM merge result schema (Gateway layer)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Abstraction Pattern schemas (Public layer)
+# ---------------------------------------------------------------------------
+
+class AbstractionPattern(BaseModel):
+    """A cross-domain problem-solving pattern extracted from a paper."""
+
+    pattern_id: str = Field(
+        default_factory=lambda: str(uuid4()),
+        description="Unique identifier for this pattern",
+    )
+    name: str = Field(description="Short, descriptive name of the pattern")
+    description: str = Field(description="Explanation of the pattern in general terms")
+    variables_template: list[str] = Field(
+        default_factory=list,
+        description="Abstract variables (X, Y, Z, …) used in the pattern",
+    )
+    structural_rules: list[str] = Field(
+        default_factory=list,
+        description="Rules describing how the variables interact (e.g. 'X inhibits Y')",
+    )
+    source_arxiv_id: str = Field(
+        default="",
+        description="arXiv ID of the paper from which this pattern was extracted",
+    )
+
+
+class PatternMatch(BaseModel):
+    """A record that a pattern matches (is isomorphic to) a target paper."""
+
+    match_id: str = Field(
+        default_factory=lambda: str(uuid4()),
+        description="Unique identifier for this match",
+    )
+    pattern_id: str = Field(description="ID of the AbstractionPattern")
+    target_arxiv_id: str = Field(description="arXiv ID of the matched paper")
+    mapping_explanation: str = Field(
+        default="",
+        description="Natural-language explanation of how the pattern maps to the paper",
+    )
+    confidence_score: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score of the match (0.0–1.0)",
+    )
 
 
 # ---------------------------------------------------------------------------

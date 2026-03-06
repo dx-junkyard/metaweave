@@ -30,7 +30,7 @@ from typing import Any
 import fitz  # PyMuPDF
 
 from metaweave.llm import get_client, get_settings
-from metaweave.schema import MergeResult, PaperStructure
+from metaweave.schema import AbstractionPattern, MergeResult, PaperStructure
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +232,25 @@ def _finalize_structure(state: _AnalysisState, paper_id: str) -> PaperStructure:
         f"{state_str}\n\n"
         "Based on the above, extract the final paper structure.\n"
         "Use both Japanese and English in descriptions. "
-        f'Set paper_id="{paper_id}".'
+        f'Set paper_id="{paper_id}".\n\n'
+        "=== MetaWeave-SMILES DSL Instructions ===\n"
+        "You MUST encode all extracted causal relationships (CausalEdge) and variables "
+        "into the MetaWeave-SMILES DSL and store the result in abstract_structure.smiles_dsl.\n\n"
+        "DSL syntax:\n"
+        "  [variableID:OntologyType:concreteValue] -[relationType:polarity]-> [targetVariableID:OntologyType:concreteValue]\n"
+        "Example:\n"
+        "  [a:Agent:Toyota] -[causes:+]-> [r:Resource:Profit]\n\n"
+        "Rules:\n"
+        "1. Each variable must be assigned an OntologyType from the following: "
+        "Agent, Resource, Event, Purpose-oriented group, Institutional Agent, Intentional Moment.\n"
+        "2. Each CausalEdge must specify polarity (+ or -) in both the edge's polarity field "
+        "and the DSL string.\n"
+        "3. Each CausalEdge must specify ontology_level with the relevant ontology relation type.\n"
+        "4. If there is a cycle (loop) among variables, reuse the variable ID "
+        "without repeating the full declaration (e.g., [a] instead of [a:Agent:Toyota]).\n"
+        "5. Chain multiple edges with spaces: "
+        "[a:Agent:X] -[causes:+]-> [r:Resource:Y] [r] -[inhibits:-]-> [a]\n"
+        "6. Classify all extraction targets strictly according to OntologyType.\n"
     )
 
     resp = client.beta.chat.completions.parse(
@@ -262,23 +280,33 @@ def _embed_and_store_chunks(chunks: list[str], paper_id: str) -> None:
 # Public: メイン抽出関数
 # ---------------------------------------------------------------------------
 
-def extract_paper_structure(text: str, paper_id: str = "") -> PaperStructure:
+def extract_paper_structure(
+    text: str, paper_id: str = "", skip_embedding: bool = False
+) -> PaperStructure:
     """仮説検証型の逐次処理で論文テキストから PaperStructure を抽出する。
 
     処理フロー:
     1. テキストをチャンク分割
-    2. Embedding を ThreadPoolExecutor でバックグラウンド並行実行
+    2. skip_embedding=False の場合のみ Embedding を ThreadPoolExecutor でバックグラウンド並行実行
     3. 最初のチャンクから初期仮説ドラフトを生成
     4. 2番目以降のチャンクで逐次精錬（状態を更新）
     5. 最終評価で PaperStructure を出力
-    6. Embedding 完了を待機（最大 90 秒）
+    6. skip_embedding=False の場合のみ Embedding 完了を待機（最大 90 秒）
+
+    Parameters
+    ----------
+    skip_embedding:
+        True の場合、Qdrant への Embedding 処理を完全にスキップする。
+        Re-Extract（ドラフト再生成）など、すでにチャンクが保存済みの場合に使用する。
     """
     chunks = chunk_text(text)
-    logger.info("paper=%s  total_chunks=%d", paper_id, len(chunks))
+    logger.info("paper=%s  total_chunks=%d  skip_embedding=%s", paper_id, len(chunks), skip_embedding)
 
-    # Embedding をバックグラウンドで並行実行
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    embed_future = executor.submit(_embed_and_store_chunks, chunks, paper_id)
+    embed_future: concurrent.futures.Future | None = None
+
+    if not skip_embedding:
+        embed_future = executor.submit(_embed_and_store_chunks, chunks, paper_id)
 
     try:
         # Step 1: 初期仮説生成（最初のチャンク）
@@ -305,11 +333,14 @@ def extract_paper_structure(text: str, paper_id: str = "") -> PaperStructure:
 
     finally:
         # Embedding の完了を待つ（最大 90 秒、失敗しても続行）
-        try:
-            embed_future.result(timeout=90)
-            logger.info("Embedding completed for %s", paper_id)
-        except Exception:
-            logger.warning("Embedding future failed for %s", paper_id, exc_info=True)
+        if embed_future is not None:
+            try:
+                embed_future.result(timeout=90)
+                logger.info("Embedding completed for %s", paper_id)
+            except Exception:
+                logger.warning("Embedding future failed for %s", paper_id, exc_info=True)
+        else:
+            logger.info("Embedding skipped for %s (skip_embedding=True)", paper_id)
         executor.shutdown(wait=False)
 
     return structure
@@ -380,3 +411,49 @@ def evaluate_and_merge_proposals(
         ),
         evaluation_reasoning=result.evaluation_reasoning,
     )
+
+
+# ---------------------------------------------------------------------------
+# Public: 抽象化パターン抽出 (Public層)
+# ---------------------------------------------------------------------------
+
+def extract_abstraction_pattern(structure: PaperStructure) -> AbstractionPattern:
+    """承認済み PaperStructure から汎用的な抽象化パターンを LLM で抽出する。
+
+    Evo-DKD アプローチに基づき、具体的事象を変数（X, Y, Z 等）に置換して
+    分野横断で適用可能な「問題解決の型」を生成する。
+
+    Parameters
+    ----------
+    structure:
+        パターン抽出対象の PaperStructure（review_status が approved 推奨）。
+
+    Returns
+    -------
+    AbstractionPattern
+        抽出された抽象化パターン。source_arxiv_id には元論文のIDがセットされる。
+    """
+    client = get_client()
+    settings = get_settings()
+
+    prompt = (
+        "あなたはメタ構造転写エンジンの一部です。\n"
+        "以下の論文構造データから、具体的な事象を「変数（X, Y, Z等）」に置き換え、\n"
+        "分野横断で適用可能な汎用的な「問題解決の型（Abstraction Pattern）」を抽出してください。\n\n"
+        "【ルール】\n"
+        "- name: パターンの簡潔な名称（英語、20語以内）\n"
+        "- description: パターンの説明（具体的なドメイン用語は使わず、抽象変数で記述）\n"
+        "- variables_template: パターン内で使われる抽象変数のリスト（例: [\"X\", \"Y\", \"Z\"]）\n"
+        "- structural_rules: 変数間の関係ルール（例: [\"X inhibits Y\", \"Y enables Z\"]）\n\n"
+        f"--- 論文構造データ ---\n{structure.model_dump_json(indent=2)}\n\n"
+        f'source_arxiv_id は "{structure.paper_id}" を設定してください。\n'
+        "JSONスキーマに厳格に従って出力してください。"
+    )
+
+    resp = client.beta.chat.completions.parse(
+        model=settings.analysis_model,
+        messages=[{"role": "user", "content": prompt}],
+        response_format=AbstractionPattern,
+    )
+    pattern: AbstractionPattern = resp.choices[0].message.parsed
+    return pattern.model_copy(update={"source_arxiv_id": structure.paper_id})

@@ -17,11 +17,14 @@ from functools import lru_cache
 
 from openai import OpenAI
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
+
+from metaweave.schema import PaperStructure
 
 logger = logging.getLogger(__name__)
 
 _COLLECTION = "papers"
+_PATTERNS_COLLECTION = "patterns"
 _VECTOR_DIM = 3072  # text-embedding-3-large の次元数
 
 
@@ -51,6 +54,7 @@ def embed_and_store(
     arxiv_id: str,
     openai_client: OpenAI,
     embedding_model: str,
+    extracted_structure: PaperStructure | None = None,
 ) -> None:
     """チャンクリストを一括 Embedding して Qdrant に upsert する。
 
@@ -64,6 +68,9 @@ def embed_and_store(
         使用する OpenAI クライアント。
     embedding_model:
         Embedding モデル名（例: "text-embedding-3-large"）。
+    extracted_structure:
+        抽出済みの PaperStructure（指定時は SMILES DSL とオントロジー情報を
+        ペイロードに付与する）。
     """
     if not chunks:
         return
@@ -84,19 +91,28 @@ def embed_and_store(
 
     # 決定論的な整数 ID を生成（arxiv_id + チャンクインデックスのハッシュ）
     safe_id = arxiv_id.replace("/", "_").replace(".", "_")
+
+    # extracted_structure が指定されている場合、SMILES DSL と変数をペイロードに追加
+    extra_payload: dict = {}
+    if extracted_structure is not None:
+        extra_payload["smiles_dsl"] = extracted_structure.abstract_structure.smiles_dsl
+        extra_payload["variables"] = extracted_structure.abstract_structure.variables
+
     points: list[PointStruct] = []
     for i, vector in enumerate(all_embeddings):
         point_id = abs(hash(f"{safe_id}_{i}")) % (2**53)
+        payload = {
+            "arxiv_id": arxiv_id,
+            "chunk_index": i,
+            # Qdrant ペイロードには先頭 500 文字のみ保存（コスト削減）
+            "text": chunks[i][:500],
+            **extra_payload,
+        }
         points.append(
             PointStruct(
                 id=point_id,
                 vector=vector,
-                payload={
-                    "arxiv_id": arxiv_id,
-                    "chunk_index": i,
-                    # Qdrant ペイロードには先頭 500 文字のみ保存（コスト削減）
-                    "text": chunks[i][:500],
-                },
+                payload=payload,
             )
         )
 
@@ -107,3 +123,141 @@ def embed_and_store(
         arxiv_id,
         _COLLECTION,
     )
+
+
+# ---------------------------------------------------------------------------
+# Patterns collection: store and search abstraction patterns
+# ---------------------------------------------------------------------------
+
+def _ensure_patterns_collection() -> None:
+    """コレクション "patterns" が存在しない場合は作成する。"""
+    client = _qdrant()
+    existing = {c.name for c in client.get_collections().collections}
+    if _PATTERNS_COLLECTION not in existing:
+        client.create_collection(
+            collection_name=_PATTERNS_COLLECTION,
+            vectors_config=VectorParams(size=_VECTOR_DIM, distance=Distance.COSINE),
+        )
+        logger.info(
+            "Qdrant collection '%s' created (dim=%d)", _PATTERNS_COLLECTION, _VECTOR_DIM
+        )
+
+
+def embed_and_store_pattern(
+    pattern_id: str,
+    pattern_text: str,
+    openai_client: OpenAI,
+    embedding_model: str,
+) -> None:
+    """パターンのテキスト表現を Embedding して Qdrant patterns コレクションに保存する。
+
+    Parameters
+    ----------
+    pattern_id:
+        AbstractionPattern の pattern_id。
+    pattern_text:
+        パターンの説明文（name + description + structural_rules を結合したもの）。
+    openai_client:
+        使用する OpenAI クライアント。
+    embedding_model:
+        Embedding モデル名。
+    """
+    _ensure_patterns_collection()
+
+    resp = openai_client.embeddings.create(model=embedding_model, input=[pattern_text])
+    vector = resp.data[0].embedding
+
+    point_id = abs(hash(f"pattern_{pattern_id}")) % (2**53)
+    _qdrant().upsert(
+        collection_name=_PATTERNS_COLLECTION,
+        points=[
+            PointStruct(
+                id=point_id,
+                vector=vector,
+                payload={"pattern_id": pattern_id, "text": pattern_text[:500]},
+            )
+        ],
+    )
+    logger.info("Stored pattern embedding for pattern_id=%s", pattern_id)
+
+
+def search_similar_papers(
+    query_text: str,
+    openai_client: OpenAI,
+    embedding_model: str,
+    top_k: int = 5,
+    exclude_arxiv_id: str | None = None,
+) -> list[dict]:
+    """パターン（またはクエリテキスト）に類似する過去の論文チャンクを Qdrant から検索する。
+
+    Returns
+    -------
+    list[dict]
+        各要素は ``{"arxiv_id": str, "score": float, "text": str}``。
+        同一 arxiv_id の重複は排除し、最高スコアのみを残す。
+    """
+    _ensure_collection()
+
+    resp = openai_client.embeddings.create(model=embedding_model, input=[query_text])
+    vector = resp.data[0].embedding
+
+    # Qdrant 検索（top_k * 3 で多めに取得して重複排除）
+    results = _qdrant().search(
+        collection_name=_COLLECTION,
+        query_vector=vector,
+        limit=top_k * 3,
+    )
+
+    seen: dict[str, dict] = {}
+    for hit in results:
+        arxiv_id = hit.payload.get("arxiv_id", "")
+        if not arxiv_id:
+            continue
+        if exclude_arxiv_id and arxiv_id == exclude_arxiv_id:
+            continue
+        if arxiv_id not in seen or hit.score > seen[arxiv_id]["score"]:
+            seen[arxiv_id] = {
+                "arxiv_id": arxiv_id,
+                "score": hit.score,
+                "text": hit.payload.get("text", ""),
+            }
+
+    # スコア降順でソートし、上位 top_k 件を返す
+    ranked = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+    return ranked[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# FANNS (Filtered ANNS) hybrid search
+# ---------------------------------------------------------------------------
+
+def search_fanns_hybrid(
+    query_regex: str,
+    query_text: str,
+    top_k: int = 5,
+) -> list[dict]:
+    """Filtered ANNS によるハイブリッド検索の基盤関数。
+
+    処理フロー:
+    1. ``query_regex`` による DB（または Qdrant ペイロード）の事前フィルタリング
+       （Pre-filtering）を行い、候補ポイント ID を絞り込む。
+    2. 絞り込まれた ID をメタデータフィルタとして ``query_text`` のベクトル検索
+       （Filtered ANNS）を実行し、意味的類似度でランキングする。
+
+    Parameters
+    ----------
+    query_regex:
+        Pre-filtering 用の正規表現パターン。SMILES DSL やオントロジー型に対して
+        マッチングを行い、検索空間を事前に絞り込む。
+    query_text:
+        ベクトル検索用のクエリテキスト。Embedding 後にフィルタ済み候補に対して
+        コサイン類似度検索を行う。
+    top_k:
+        返却する上位件数。
+
+    Returns
+    -------
+    list[dict]
+        検索結果のリスト（詳細は実装時に確定）。
+    """
+    raise NotImplementedError("FANNS hybrid search is not yet implemented.")
