@@ -171,3 +171,29 @@ class MergeResult(BaseModel):
     evaluation_reasoning: str = Field(
         description="Explanation of what was merged, improved, or rejected and why"
     )
+
+
+# ---------------------------------------------------------------------------
+# Missing Link Suggestion schemas (v2 feature)
+# ---------------------------------------------------------------------------
+
+class FieldSuggestion(BaseModel):
+    """A single field suggestion for a Missing Link search."""
+
+    field: str = Field(description="Recommended academic field or domain")
+    reasoning: str = Field(description="Why this field might exhibit the same structural pattern")
+    keywords: list[str] = Field(
+        default_factory=list,
+        description="Suggested arXiv search keywords combining pattern structure with field terminology",
+    )
+
+
+class MissingLinkSuggestion(BaseModel):
+    """LLM-generated suggestions for structural holes in the Pattern Library."""
+
+    pattern_id: str = Field(description="ID of the source AbstractionPattern")
+    pattern_name: str = Field(default="", description="Name of the pattern for display")
+    suggestions: list[FieldSuggestion] = Field(
+        default_factory=list,
+        description="List of field-specific search suggestions",
+    )
