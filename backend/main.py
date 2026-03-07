@@ -3,6 +3,7 @@
 Endpoints
 ---------
 GET  /api/search                        Search arXiv for papers.
+POST /api/search/structure              FANNS hybrid search (DSL regex + vector similarity).
 POST /api/fetch                         Download a paper PDF and store it in MinIO.
 POST /api/extract                       Submit async background extraction job.
 GET  /api/extract-status/{arxiv_id}     Poll extraction job status (pending/processing/completed/failed).
@@ -43,7 +44,7 @@ from metaweave import extractor as ext
 from metaweave.batch import run_pattern_evaluation_task
 from metaweave.chat import generate_chat_response
 from metaweave.db import get_driver
-from metaweave.embedder import embed_and_store_pattern
+from metaweave.embedder import embed_and_store_pattern, search_fanns_hybrid
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
 from metaweave.llm import get_client, get_settings
 from metaweave.schema import AbstractionPattern, PaperStructure, PatternMatch, StructureProposal
@@ -295,6 +296,35 @@ class PatternRegisterResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# FANNS structure search request / response models
+# ---------------------------------------------------------------------------
+
+class StructureSearchRequest(BaseModel):
+    """Request body for POST /api/search/structure."""
+
+    query_dsl_regex: str = ""
+    query_text: str = ""
+    top_k: int = 5
+
+
+class StructureSearchHit(BaseModel):
+    """A single result from the FANNS hybrid search."""
+
+    arxiv_id: str
+    score: float
+    text: str
+    smiles_dsl: str = ""
+    variables: list[str] = []
+
+
+class StructureSearchResponse(BaseModel):
+    """Response for POST /api/search/structure."""
+
+    hits: list[StructureSearchHit]
+    total: int
+
+
+# ---------------------------------------------------------------------------
 # Auth utility functions
 # ---------------------------------------------------------------------------
 
@@ -450,6 +480,51 @@ def search(
         )
         for m in results
     ]
+
+
+@app.post("/api/search/structure", response_model=StructureSearchResponse)
+def search_structure(body: StructureSearchRequest) -> StructureSearchResponse:
+    """FANNS ハイブリッド検索エンドポイント。
+
+    正規表現ベースの DSL パターンフィルタと自然言語クエリのベクトル検索を
+    組み合わせて、構造的に類似する論文を返す。
+
+    - ``query_dsl_regex``: SMILES DSL ペイロードに対する正規表現（例: ``"Agent.*Resource"``）
+    - ``query_text``: 意味的類似度検索用の自然言語クエリ
+    - ``top_k``: 返却する上位件数（デフォルト 5）
+
+    少なくとも ``query_dsl_regex`` か ``query_text`` のいずれか一方は必須。
+    """
+    if not body.query_dsl_regex and not body.query_text:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of 'query_dsl_regex' or 'query_text' must be provided.",
+        )
+
+    try:
+        results = search_fanns_hybrid(
+            query_dsl_regex=body.query_dsl_regex,
+            query_text=body.query_text,
+            top_k=body.top_k,
+        )
+    except Exception as exc:
+        logger.exception("FANNS structure search failed")
+        raise HTTPException(
+            status_code=500, detail=f"Structure search failed: {exc}"
+        ) from exc
+
+    hits = [
+        StructureSearchHit(
+            arxiv_id=r["arxiv_id"],
+            score=r["score"],
+            text=r["text"],
+            smiles_dsl=r.get("smiles_dsl", ""),
+            variables=r.get("variables", []),
+        )
+        for r in results
+    ]
+
+    return StructureSearchResponse(hits=hits, total=len(hits))
 
 
 @app.post("/api/fetch", response_model=FetchResponse)
