@@ -19,6 +19,7 @@ POST /api/patterns/register             Register a confirmed pattern to Qdrant/N
 POST /api/auth/register                 Register a new user (Neo4j User node, returns JWT).
 POST /api/auth/login                    Authenticate and return a JWT.
 GET  /api/auth/me                       Return the current user's profile (requires Bearer token).
+GET  /api/patterns/{pattern_id}/suggestions  Missing link suggestions for a pattern.
 GET  /healthz                           Health check.
 """
 
@@ -46,8 +47,15 @@ from metaweave.chat import generate_chat_response
 from metaweave.db import get_driver
 from metaweave.embedder import embed_and_store_pattern, search_fanns_hybrid
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
-from metaweave.llm import get_client, get_settings
-from metaweave.schema import AbstractionPattern, PaperStructure, PatternMatch, StructureProposal
+from metaweave.llm import generate_missing_link_suggestions, get_client, get_settings
+from metaweave.schema import (
+    AbstractionPattern,
+    FieldSuggestion,
+    MissingLinkSuggestion,
+    PaperStructure,
+    PatternMatch,
+    StructureProposal,
+)
 from metaweave.storage import StorageManager
 
 logging.basicConfig(level=logging.INFO)
@@ -286,6 +294,23 @@ class PatternRegisterRequest(BaseModel):
     """Request body for POST /api/patterns/register."""
 
     pattern: AbstractionPattern
+
+
+class SuggestionOut(BaseModel):
+    """A single field suggestion for Missing Link."""
+
+    field: str
+    reasoning: str
+    keywords: list[str]
+
+
+class MissingLinkSuggestionResponse(BaseModel):
+    """Response for GET /api/patterns/{pattern_id}/suggestions."""
+
+    pattern_id: str
+    pattern_name: str
+    suggestions: list[SuggestionOut]
+    cached: bool = False
 
 
 class PatternRegisterResponse(BaseModel):
@@ -1369,3 +1394,146 @@ def get_paper_patterns(arxiv_id: str) -> PaperPatternListResponse:
     ]
 
     return PaperPatternListResponse(matches=matches)
+
+
+# ---------------------------------------------------------------------------
+# Missing Link Suggestion endpoint
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/patterns/{pattern_id}/suggestions",
+    response_model=MissingLinkSuggestionResponse,
+)
+def get_pattern_suggestions(
+    pattern_id: str,
+    refresh: bool = Query(False, description="Force re-generation ignoring cache"),
+) -> MissingLinkSuggestionResponse:
+    """パターンの構造的空白を検知し、異分野への検索サジェストを生成する。
+
+    結果は Neo4j にキャッシュし、再呼び出し時はキャッシュを返す。
+    ``refresh=true`` でキャッシュを無視して再生成する。
+    """
+
+    driver = get_driver()
+
+    # ── 1. Neo4j からパターンメタデータを取得 ──────────────────────────────
+    with driver.session() as session:
+        record = session.run(
+            """
+            MATCH (ap:AbstractionPattern {pattern_id: $pid})
+            RETURN ap.name               AS name,
+                   ap.description         AS description,
+                   ap.variables_template  AS variables_template,
+                   ap.structural_rules    AS structural_rules,
+                   ap.source_arxiv_id     AS source_arxiv_id
+            """,
+            pid=pattern_id,
+        ).single()
+
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Pattern '{pattern_id}' not found")
+
+    pat_name = record.get("name", "")
+    pat_desc = record.get("description", "")
+    vt_raw = record.get("variables_template", "[]")
+    sr_raw = record.get("structural_rules", "[]")
+
+    try:
+        variables_template = json.loads(vt_raw) if isinstance(vt_raw, str) else (vt_raw or [])
+    except Exception:
+        variables_template = []
+    try:
+        structural_rules = json.loads(sr_raw) if isinstance(sr_raw, str) else (sr_raw or [])
+    except Exception:
+        structural_rules = []
+
+    # ── 2. キャッシュ確認（refresh=false のとき） ─────────────────────────
+    if not refresh:
+        with driver.session() as session:
+            cached = session.run(
+                """
+                MATCH (ap:AbstractionPattern {pattern_id: $pid})
+                      -[:HAS_SUGGESTIONS]->(s:MissingLinkSuggestion)
+                RETURN s.suggestions_json AS suggestions_json
+                """,
+                pid=pattern_id,
+            ).single()
+        if cached and cached.get("suggestions_json"):
+            try:
+                cached_data = json.loads(cached["suggestions_json"])
+                return MissingLinkSuggestionResponse(
+                    pattern_id=pattern_id,
+                    pattern_name=pat_name,
+                    suggestions=[SuggestionOut(**s) for s in cached_data],
+                    cached=True,
+                )
+            except Exception:
+                logger.warning("Failed to parse cached suggestions for %s, regenerating", pattern_id)
+
+    # ── 3. 既にカバーされている分野を収集 ─────────────────────────────────
+    existing_fields: list[str] = []
+    with driver.session() as session:
+        matched_records = session.run(
+            """
+            MATCH (p:Paper)-[:MATCHES_PATTERN|HAS_PATTERN]->
+                  (ap:AbstractionPattern {pattern_id: $pid})
+            RETURN DISTINCT p.categories AS categories
+            """,
+            pid=pattern_id,
+        ).data()
+    for mr in matched_records:
+        cats = mr.get("categories")
+        if cats:
+            if isinstance(cats, str):
+                try:
+                    cats = json.loads(cats)
+                except Exception:
+                    cats = [cats]
+            if isinstance(cats, list):
+                existing_fields.extend(cats)
+
+    # ── 4. LLM で Missing Link サジェストを生成 ──────────────────────────
+    try:
+        result = generate_missing_link_suggestions(
+            pattern_name=pat_name,
+            pattern_description=pat_desc,
+            structural_rules=structural_rules,
+            variables_template=variables_template,
+            existing_fields=list(set(existing_fields)) if existing_fields else None,
+        )
+    except Exception as exc:
+        logger.exception("Missing link suggestion failed for %s", pattern_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Suggestion generation failed: {exc}",
+        ) from exc
+
+    suggestions = result.get("suggestions", [])
+
+    # ── 5. Neo4j にキャッシュ保存 ────────────────────────────────────────
+    try:
+        with driver.session() as session:
+            session.run(
+                """
+                MATCH (ap:AbstractionPattern {pattern_id: $pid})
+                OPTIONAL MATCH (ap)-[r:HAS_SUGGESTIONS]->(old:MissingLinkSuggestion)
+                DELETE r, old
+                WITH ap
+                CREATE (s:MissingLinkSuggestion {
+                    suggestions_json: $sj,
+                    created_at: datetime()
+                })
+                CREATE (ap)-[:HAS_SUGGESTIONS]->(s)
+                """,
+                pid=pattern_id,
+                sj=json.dumps(suggestions, ensure_ascii=False),
+            )
+    except Exception:
+        logger.warning("Failed to cache suggestions for %s", pattern_id, exc_info=True)
+
+    return MissingLinkSuggestionResponse(
+        pattern_id=pattern_id,
+        pattern_name=pat_name,
+        suggestions=[SuggestionOut(**s) for s in suggestions],
+        cached=False,
+    )

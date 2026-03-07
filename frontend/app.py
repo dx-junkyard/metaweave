@@ -74,6 +74,9 @@ if "xd_results" not in st.session_state:
     st.session_state.xd_results: list[dict] = []
 if "xd_searched" not in st.session_state:
     st.session_state.xd_searched: bool = False
+# Missing Link Suggestion キャッシュ: pattern_id -> suggestion response dict
+if "missing_link_suggestions" not in st.session_state:
+    st.session_state.missing_link_suggestions: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +388,21 @@ def api_register_pattern(pattern: dict) -> dict:
     )
     resp.raise_for_status()
     return resp.json()  # {pattern_id, status: "registered"}
+
+
+def api_get_missing_link_suggestions(pattern_id: str, refresh: bool = False) -> dict:
+    """GET /api/patterns/{pattern_id}/suggestions — fetch missing link suggestions."""
+    params = {}
+    if refresh:
+        params["refresh"] = "true"
+    resp = requests.get(
+        f"{BACKEND_URL}/api/patterns/{pattern_id}/suggestions",
+        params=params,
+        headers=_auth_headers(),
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _auth_post(path: str, payload: dict) -> dict:
@@ -1281,6 +1299,77 @@ elif page == "Pattern Library":
                         )
                     except Exception:
                         st.caption("情報の取得に失敗しました。")
+
+                # ── Missing Link Suggestion ──────────────────────────
+                with st.expander("Missing Link Suggestion"):
+                    st.caption(
+                        "AIがこのパターンの「構造的空白」を検知し、"
+                        "まだカバーされていない分野への検索キーワードを提案します。"
+                    )
+
+                    _sug_col1, _sug_col2, _ = st.columns([1, 1, 4])
+                    with _sug_col1:
+                        _sug_fetch = st.button(
+                            "Suggest",
+                            key=f"btn_suggest_{_pat_id}",
+                            use_container_width=True,
+                            type="primary",
+                        )
+                    with _sug_col2:
+                        _sug_refresh = st.button(
+                            "Re-generate",
+                            key=f"btn_suggest_refresh_{_pat_id}",
+                            use_container_width=True,
+                        )
+
+                    if _sug_fetch or _sug_refresh:
+                        with st.spinner("AIが構造的空白を分析中…"):
+                            try:
+                                _sug_data = api_get_missing_link_suggestions(
+                                    _pat_id, refresh=_sug_refresh,
+                                )
+                                st.session_state.missing_link_suggestions[_pat_id] = _sug_data
+                            except Exception as _sug_exc:
+                                st.error(f"サジェスト生成に失敗しました: {_sug_exc}")
+
+                    _sug_cached = st.session_state.missing_link_suggestions.get(_pat_id)
+                    if _sug_cached:
+                        if _sug_cached.get("cached"):
+                            st.info("キャッシュされた結果を表示しています。「Re-generate」で再生成できます。")
+
+                        for _si, _sug in enumerate(_sug_cached.get("suggestions", [])):
+                            _sug_field = _sug.get("field", "")
+                            _sug_reason = _sug.get("reasoning", "")
+                            _sug_kws = _sug.get("keywords", [])
+
+                            st.markdown(f"**{_si + 1}. {_sug_field}**")
+                            st.markdown(f"  {_sug_reason}")
+
+                            if _sug_kws:
+                                _kw_cols = st.columns(min(len(_sug_kws), 4))
+                                for _ki, _kw in enumerate(_sug_kws):
+                                    with _kw_cols[_ki % len(_kw_cols)]:
+                                        if st.button(
+                                            f"Search: {_kw}",
+                                            key=f"btn_kw_{_pat_id}_{_si}_{_ki}",
+                                            use_container_width=True,
+                                        ):
+                                            # arXiv 検索画面に遷移して検索を実行
+                                            st.session_state.search_results = []
+                                            try:
+                                                _kw_resp = requests.get(
+                                                    f"{BACKEND_URL}/api/search",
+                                                    params={"q": _kw, "max_results": 10},
+                                                    headers=_auth_headers(),
+                                                    timeout=30,
+                                                )
+                                                _kw_resp.raise_for_status()
+                                                st.session_state.search_results = _kw_resp.json()
+                                                st.toast(f"「{_kw}」で {len(st.session_state.search_results)} 件見つかりました")
+                                            except Exception as _kw_exc:
+                                                st.error(f"検索に失敗しました: {_kw_exc}")
+
+                            st.divider()
 
 # =========================================================================
 # Page D — Cross-Domain Search (分野横断構造検索)
