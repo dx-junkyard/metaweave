@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from functools import lru_cache
 
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
 
+from metaweave.llm import get_client, get_settings
 from metaweave.schema import PaperStructure
 
 logger = logging.getLogger(__name__)
@@ -232,32 +234,95 @@ def search_similar_papers(
 # ---------------------------------------------------------------------------
 
 def search_fanns_hybrid(
-    query_regex: str,
+    query_dsl_regex: str,
     query_text: str,
     top_k: int = 5,
 ) -> list[dict]:
-    """Filtered ANNS によるハイブリッド検索の基盤関数。
+    """Filtered ANNS によるハイブリッド検索。
 
     処理フロー:
-    1. ``query_regex`` による DB（または Qdrant ペイロード）の事前フィルタリング
-       （Pre-filtering）を行い、候補ポイント ID を絞り込む。
-    2. 絞り込まれた ID をメタデータフィルタとして ``query_text`` のベクトル検索
-       （Filtered ANNS）を実行し、意味的類似度でランキングする。
+    1. ``query_text`` を Embedding モデルでベクトル化する。
+    2. Qdrant papers コレクションに対してベクトル類似度検索を行う
+       （候補を多めに取得）。
+    3. ``query_dsl_regex`` を正規表現としてコンパイルし、各候補の
+       ``smiles_dsl`` ペイロードフィールドに対してマッチングを行い、
+       構造パターンに合致しない候補を除外する（Post-filtering）。
+    4. 同一 ``arxiv_id`` の重複を排除し、最高スコアのもののみを残す。
+    5. スコア降順でソートし、上位 ``top_k`` 件を返す。
 
     Parameters
     ----------
-    query_regex:
-        Pre-filtering 用の正規表現パターン。SMILES DSL やオントロジー型に対して
-        マッチングを行い、検索空間を事前に絞り込む。
+    query_dsl_regex:
+        SMILES DSL ペイロードに対する正規表現パターン。例えば
+        ``"Agent.*Resource"`` のように、因果構造の部分パターンを指定する。
+        空文字列の場合はフィルタリングをスキップし、純粋なベクトル検索のみ行う。
     query_text:
-        ベクトル検索用のクエリテキスト。Embedding 後にフィルタ済み候補に対して
-        コサイン類似度検索を行う。
+        ベクトル検索用の自然言語クエリ。Embedding 後にコサイン類似度検索を行う。
     top_k:
         返却する上位件数。
 
     Returns
     -------
     list[dict]
-        検索結果のリスト（詳細は実装時に確定）。
+        各要素は ``{"arxiv_id": str, "score": float, "text": str,
+        "smiles_dsl": str, "variables": list[str]}``。
     """
-    raise NotImplementedError("FANNS hybrid search is not yet implemented.")
+    _ensure_collection()
+
+    client = get_client()
+    settings = get_settings()
+
+    # 1. query_text をベクトル化
+    resp = client.embeddings.create(model=settings.embedding_model, input=[query_text])
+    query_vector = resp.data[0].embedding
+
+    # 2. Qdrant ベクトル検索（フィルタ後に十分な候補が残るよう多めに取得）
+    search_limit = top_k * 10 if query_dsl_regex else top_k * 3
+    results = _qdrant().search(
+        collection_name=_COLLECTION,
+        query_vector=query_vector,
+        limit=search_limit,
+    )
+
+    # 3. 正規表現による smiles_dsl フィルタリング（Post-filtering）
+    compiled_re = None
+    if query_dsl_regex:
+        try:
+            compiled_re = re.compile(query_dsl_regex, re.IGNORECASE)
+        except re.error:
+            logger.warning("Invalid regex pattern: %s — skipping DSL filter", query_dsl_regex)
+
+    filtered: list[dict] = []
+    for hit in results:
+        arxiv_id = hit.payload.get("arxiv_id", "")
+        if not arxiv_id:
+            continue
+        smiles_dsl = hit.payload.get("smiles_dsl", "")
+        variables = hit.payload.get("variables", [])
+
+        # 正規表現フィルタが有効な場合、smiles_dsl にマッチしない候補を除外
+        if compiled_re and not compiled_re.search(smiles_dsl or ""):
+            continue
+
+        filtered.append({
+            "arxiv_id": arxiv_id,
+            "score": hit.score,
+            "text": hit.payload.get("text", ""),
+            "smiles_dsl": smiles_dsl,
+            "variables": variables,
+        })
+
+    # 4. 同一 arxiv_id の重複を排除（最高スコアを保持）
+    seen: dict[str, dict] = {}
+    for item in filtered:
+        aid = item["arxiv_id"]
+        if aid not in seen or item["score"] > seen[aid]["score"]:
+            seen[aid] = item
+
+    # 5. スコア降順ソート → 上位 top_k 件
+    ranked = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+    logger.info(
+        "FANNS hybrid search: regex=%r, candidates=%d, after_filter=%d, returned=%d",
+        query_dsl_regex, len(results), len(seen), min(len(ranked), top_k),
+    )
+    return ranked[:top_k]
