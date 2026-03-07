@@ -13,12 +13,11 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from functools import lru_cache
 
 from openai import OpenAI
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchText, MatchValue, PointStruct, VectorParams
 
 from metaweave.llm import get_client, get_settings
 from metaweave.schema import PaperStructure
@@ -238,23 +237,27 @@ def search_fanns_hybrid(
     query_text: str,
     top_k: int = 5,
 ) -> list[dict]:
-    """Filtered ANNS によるハイブリッド検索。
+    """Filtered ANNS (Pre-filtering) によるハイブリッド検索。
+
+    FANNSアーキテクチャ: Qdrant の query_filter を用いた Pre-filtering により、
+    「意味（ベクトル）は遠いが構造（SMILES DSL）が一致する異分野の論文」を
+    確実に発見する。Post-filtering では意味が遠い論文がベクトル検索の時点で
+    足切りされるため、分野横断検索が成立しない。
 
     処理フロー:
     1. ``query_text`` を Embedding モデルでベクトル化する。
-    2. Qdrant papers コレクションに対してベクトル類似度検索を行う
-       （候補を多めに取得）。
-    3. ``query_dsl_regex`` を正規表現としてコンパイルし、各候補の
-       ``smiles_dsl`` ペイロードフィールドに対してマッチングを行い、
-       構造パターンに合致しない候補を除外する（Post-filtering）。
+    2. ``query_dsl_regex`` が指定されている場合、Qdrant の ``MatchText``
+       フィルタを構築し、``smiles_dsl`` ペイロードで DB 側事前絞り込みを行う。
+    3. フィルタ付きベクトル検索を実行し、構造が一致する候補の中から
+       意味的に近い順にランキングする。
     4. 同一 ``arxiv_id`` の重複を排除し、最高スコアのもののみを残す。
     5. スコア降順でソートし、上位 ``top_k`` 件を返す。
 
     Parameters
     ----------
     query_dsl_regex:
-        SMILES DSL ペイロードに対する正規表現パターン。例えば
-        ``"Agent.*Resource"`` のように、因果構造の部分パターンを指定する。
+        SMILES DSL ペイロードに対するテキストフィルタパターン。
+        Qdrant の MatchText（全文検索）を使用して DB 側で事前絞り込みを行う。
         空文字列の場合はフィルタリングをスキップし、純粋なベクトル検索のみ行う。
     query_text:
         ベクトル検索用の自然言語クエリ。Embedding 後にコサイン類似度検索を行う。
@@ -276,53 +279,46 @@ def search_fanns_hybrid(
     resp = client.embeddings.create(model=settings.embedding_model, input=[query_text])
     query_vector = resp.data[0].embedding
 
-    # 2. Qdrant ベクトル検索（フィルタ後に十分な候補が残るよう多めに取得）
-    search_limit = top_k * 10 if query_dsl_regex else top_k * 3
+    # 2. Pre-filtering: Qdrant の MatchText で smiles_dsl を DB 側で事前絞り込み
+    query_filter = None
+    if query_dsl_regex:
+        query_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="smiles_dsl",
+                    match=MatchText(text=query_dsl_regex),
+                )
+            ]
+        )
+
+    # 3. フィルタ付きベクトル検索（構造一致 → 意味的類似度ランキング）
     results = _qdrant().search(
         collection_name=_COLLECTION,
         query_vector=query_vector,
-        limit=search_limit,
+        query_filter=query_filter,
+        limit=top_k * 3,
     )
 
-    # 3. 正規表現による smiles_dsl フィルタリング（Post-filtering）
-    compiled_re = None
-    if query_dsl_regex:
-        try:
-            compiled_re = re.compile(query_dsl_regex, re.IGNORECASE)
-        except re.error:
-            logger.warning("Invalid regex pattern: %s — skipping DSL filter", query_dsl_regex)
-
-    filtered: list[dict] = []
+    # 4. 同一 arxiv_id の重複を排除（最高スコアを保持）
+    seen: dict[str, dict] = {}
     for hit in results:
         arxiv_id = hit.payload.get("arxiv_id", "")
         if not arxiv_id:
             continue
-        smiles_dsl = hit.payload.get("smiles_dsl", "")
-        variables = hit.payload.get("variables", [])
-
-        # 正規表現フィルタが有効な場合、smiles_dsl にマッチしない候補を除外
-        if compiled_re and not compiled_re.search(smiles_dsl or ""):
-            continue
-
-        filtered.append({
-            "arxiv_id": arxiv_id,
-            "score": hit.score,
-            "text": hit.payload.get("text", ""),
-            "smiles_dsl": smiles_dsl,
-            "variables": variables,
-        })
-
-    # 4. 同一 arxiv_id の重複を排除（最高スコアを保持）
-    seen: dict[str, dict] = {}
-    for item in filtered:
-        aid = item["arxiv_id"]
-        if aid not in seen or item["score"] > seen[aid]["score"]:
-            seen[aid] = item
+        aid = arxiv_id
+        if aid not in seen or hit.score > seen[aid]["score"]:
+            seen[aid] = {
+                "arxiv_id": arxiv_id,
+                "score": hit.score,
+                "text": hit.payload.get("text", ""),
+                "smiles_dsl": hit.payload.get("smiles_dsl", ""),
+                "variables": hit.payload.get("variables", []),
+            }
 
     # 5. スコア降順ソート → 上位 top_k 件
     ranked = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
     logger.info(
-        "FANNS hybrid search: regex=%r, candidates=%d, after_filter=%d, returned=%d",
+        "FANNS hybrid search: filter=%r, candidates=%d, unique=%d, returned=%d",
         query_dsl_regex, len(results), len(seen), min(len(ranked), top_k),
     )
     return ranked[:top_k]
