@@ -527,6 +527,111 @@ def search_structure(body: StructureSearchRequest) -> StructureSearchResponse:
     return StructureSearchResponse(hits=hits, total=len(hits))
 
 
+# ---------------------------------------------------------------------------
+# Natural Language → SMILES DSL conversion
+# ---------------------------------------------------------------------------
+
+class NlToDslRequest(BaseModel):
+    """Request body for POST /api/search/nl-to-dsl."""
+
+    natural_language_query: str
+
+
+class NlToDslResponse(BaseModel):
+    """Response for POST /api/search/nl-to-dsl."""
+
+    query_dsl_regex: str
+    explanation: str
+
+
+_NL_TO_DSL_PROMPT = """\
+あなたは MetaWeave の構造検索アシスタントです。
+ユーザーが自然言語で述べた課題・疑問を、MetaWeave-SMILES DSL の正規表現パターンに変換してください。
+
+## MetaWeave-SMILES DSL の書式
+- 変数: [略号:概念名:オントロジータイプ]  例: [a:Agent:Organization]
+- 因果辺: -[relation:polarity]->  例: -[cause:+]->
+- オントロジータイプ: Agent, Resource, Event, Purpose, InstitutionalAgent, IntentionalMoment
+
+## 出力ルール
+1. Qdrant の payload テキスト検索 (部分一致) に適した正規表現を生成する
+2. ワイルドカード (.*) を活用し、具体的なドメイン用語ではなく抽象的な構造パターンを捉える
+3. 複数のパターンが考えられる場合は、最も包括的な1つを選ぶ
+4. 出力は JSON 形式で返す: {"query_dsl_regex": "<正規表現>", "explanation": "<日本語での簡潔な説明>"}
+
+## 例
+入力: "限られた資源を複数の主体が奪い合う問題"
+出力: {"query_dsl_regex": "\\\\[.*:Agent\\\\].*-\\\\[.*compete.*\\\\]->.*\\\\[.*:Resource\\\\]", "explanation": "複数のエージェントがリソースを巡って競合する構造パターン"}
+
+入力: "技術革新が既存のビジネスモデルを破壊する現象"
+出力: {"query_dsl_regex": "\\\\[.*:Event\\\\].*-\\\\[.*destroy.*:-\\\\]->.*\\\\[.*:Resource\\\\]", "explanation": "イベント（技術革新）がリソース（ビジネスモデル）を負の方向に変化させる構造"}
+"""
+
+
+@app.post("/api/search/nl-to-dsl", response_model=NlToDslResponse)
+def nl_to_dsl(body: NlToDslRequest) -> NlToDslResponse:
+    """自然言語クエリを MetaWeave-SMILES DSL 正規表現に変換する。
+
+    LLM を使い、ユーザーの課題記述を Qdrant ペイロード検索互換の
+    DSL 正規表現に変換して返す。
+    """
+    if not body.natural_language_query.strip():
+        raise HTTPException(status_code=400, detail="natural_language_query is required.")
+
+    client = get_client()
+    settings = get_settings()
+
+    try:
+        response = client.chat.completions.create(
+            model=settings.analysis_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"{_NL_TO_DSL_PROMPT}\n\n"
+                        f"入力: \"{body.natural_language_query}\"\n"
+                        "出力:"
+                    ),
+                },
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+
+        # JSON 部分を抽出（コードブロック記法に対応）
+        if "```" in raw:
+            # ```json ... ``` or ``` ... ```
+            import re as _re
+            _match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, _re.DOTALL)
+            if _match:
+                raw = _match.group(1)
+        elif raw.startswith("{"):
+            pass  # already JSON
+        else:
+            # 行内の最初の { ... } を抜き出す
+            import re as _re
+            _match = _re.search(r"\{.*\}", raw, _re.DOTALL)
+            if _match:
+                raw = _match.group(0)
+
+        parsed = json.loads(raw)
+        return NlToDslResponse(
+            query_dsl_regex=parsed.get("query_dsl_regex", ""),
+            explanation=parsed.get("explanation", ""),
+        )
+    except json.JSONDecodeError:
+        logger.warning("NL-to-DSL: LLM response was not valid JSON: %s", raw)
+        # フォールバック: raw テキストをそのまま regex として返す
+        return NlToDslResponse(
+            query_dsl_regex=raw[:500] if raw else "",
+            explanation="LLM出力のJSON解析に失敗しました。手動で調整してください。",
+        )
+    except Exception as exc:
+        logger.exception("NL-to-DSL conversion failed")
+        raise HTTPException(
+            status_code=500, detail=f"NL-to-DSL conversion failed: {exc}"
+        ) from exc
+
+
 @app.post("/api/fetch", response_model=FetchResponse)
 def fetch(body: FetchRequest) -> FetchResponse:
     """Download the PDF for the specified paper and store it in MinIO."""
