@@ -164,6 +164,14 @@ class PatternMatch(BaseModel):
 # LLM merge result schema (Gateway layer)
 # ---------------------------------------------------------------------------
 
+class FieldDiff(BaseModel):
+    """A single field-level diff between base and proposed structures."""
+
+    field_path: str = Field(description="Dot-separated path to the changed field (e.g. 'hypothesis.statement')")
+    base_value: str = Field(default="", description="Value in the base (canonical) structure")
+    proposed_value: str = Field(default="", description="Value in the proposed structure")
+
+
 class MergeResult(BaseModel):
     """Result of the LLM-driven proposal evaluation and merge."""
 
