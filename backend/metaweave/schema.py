@@ -82,6 +82,7 @@ class PaperStructure(BaseModel):
     methodology: Methodology = Field(default_factory=Methodology)
     constraints: Constraints = Field(default_factory=Constraints)
     abstract_structure: AbstractStructure = Field(default_factory=AbstractStructure)
+    license: str = Field(default="", description="The license of the paper (e.g., from arXiv metadata)")
     review_status: ReviewStatus = Field(default=ReviewStatus.PENDING)
     reviewer_notes: str = Field(default="")
 
