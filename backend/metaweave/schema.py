@@ -164,10 +164,44 @@ class PatternMatch(BaseModel):
 # LLM merge result schema (Gateway layer)
 # ---------------------------------------------------------------------------
 
+class FieldDiff(BaseModel):
+    """A single field-level diff between base and proposed structures."""
+
+    field_path: str = Field(description="Dot-separated path to the changed field (e.g. 'hypothesis.statement')")
+    base_value: str = Field(default="", description="Value in the base (canonical) structure")
+    proposed_value: str = Field(default="", description="Value in the proposed structure")
+
+
 class MergeResult(BaseModel):
     """Result of the LLM-driven proposal evaluation and merge."""
 
     merged_structure: PaperStructure = Field(description="The merged canonical structure")
     evaluation_reasoning: str = Field(
         description="Explanation of what was merged, improved, or rejected and why"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Missing Link Suggestion schemas (v2 feature)
+# ---------------------------------------------------------------------------
+
+class FieldSuggestion(BaseModel):
+    """A single field suggestion for a Missing Link search."""
+
+    field: str = Field(description="Recommended academic field or domain")
+    reasoning: str = Field(description="Why this field might exhibit the same structural pattern")
+    keywords: list[str] = Field(
+        default_factory=list,
+        description="Suggested arXiv search keywords combining pattern structure with field terminology",
+    )
+
+
+class MissingLinkSuggestion(BaseModel):
+    """LLM-generated suggestions for structural holes in the Pattern Library."""
+
+    pattern_id: str = Field(description="ID of the source AbstractionPattern")
+    pattern_name: str = Field(default="", description="Name of the pattern for display")
+    suggestions: list[FieldSuggestion] = Field(
+        default_factory=list,
+        description="List of field-specific search suggestions",
     )

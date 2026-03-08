@@ -17,8 +17,9 @@ from functools import lru_cache
 
 from openai import OpenAI
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchText, MatchValue, PointStruct, VectorParams
 
+from metaweave.llm import get_client, get_settings
 from metaweave.schema import PaperStructure
 
 logger = logging.getLogger(__name__)
@@ -232,32 +233,92 @@ def search_similar_papers(
 # ---------------------------------------------------------------------------
 
 def search_fanns_hybrid(
-    query_regex: str,
+    query_dsl_regex: str,
     query_text: str,
     top_k: int = 5,
 ) -> list[dict]:
-    """Filtered ANNS によるハイブリッド検索の基盤関数。
+    """Filtered ANNS (Pre-filtering) によるハイブリッド検索。
+
+    FANNSアーキテクチャ: Qdrant の query_filter を用いた Pre-filtering により、
+    「意味（ベクトル）は遠いが構造（SMILES DSL）が一致する異分野の論文」を
+    確実に発見する。Post-filtering では意味が遠い論文がベクトル検索の時点で
+    足切りされるため、分野横断検索が成立しない。
 
     処理フロー:
-    1. ``query_regex`` による DB（または Qdrant ペイロード）の事前フィルタリング
-       （Pre-filtering）を行い、候補ポイント ID を絞り込む。
-    2. 絞り込まれた ID をメタデータフィルタとして ``query_text`` のベクトル検索
-       （Filtered ANNS）を実行し、意味的類似度でランキングする。
+    1. ``query_text`` を Embedding モデルでベクトル化する。
+    2. ``query_dsl_regex`` が指定されている場合、Qdrant の ``MatchText``
+       フィルタを構築し、``smiles_dsl`` ペイロードで DB 側事前絞り込みを行う。
+    3. フィルタ付きベクトル検索を実行し、構造が一致する候補の中から
+       意味的に近い順にランキングする。
+    4. 同一 ``arxiv_id`` の重複を排除し、最高スコアのもののみを残す。
+    5. スコア降順でソートし、上位 ``top_k`` 件を返す。
 
     Parameters
     ----------
-    query_regex:
-        Pre-filtering 用の正規表現パターン。SMILES DSL やオントロジー型に対して
-        マッチングを行い、検索空間を事前に絞り込む。
+    query_dsl_regex:
+        SMILES DSL ペイロードに対するテキストフィルタパターン。
+        Qdrant の MatchText（全文検索）を使用して DB 側で事前絞り込みを行う。
+        空文字列の場合はフィルタリングをスキップし、純粋なベクトル検索のみ行う。
     query_text:
-        ベクトル検索用のクエリテキスト。Embedding 後にフィルタ済み候補に対して
-        コサイン類似度検索を行う。
+        ベクトル検索用の自然言語クエリ。Embedding 後にコサイン類似度検索を行う。
     top_k:
         返却する上位件数。
 
     Returns
     -------
     list[dict]
-        検索結果のリスト（詳細は実装時に確定）。
+        各要素は ``{"arxiv_id": str, "score": float, "text": str,
+        "smiles_dsl": str, "variables": list[str]}``。
     """
-    raise NotImplementedError("FANNS hybrid search is not yet implemented.")
+    _ensure_collection()
+
+    client = get_client()
+    settings = get_settings()
+
+    # 1. query_text をベクトル化
+    resp = client.embeddings.create(model=settings.embedding_model, input=[query_text])
+    query_vector = resp.data[0].embedding
+
+    # 2. Pre-filtering: Qdrant の MatchText で smiles_dsl を DB 側で事前絞り込み
+    query_filter = None
+    if query_dsl_regex:
+        query_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="smiles_dsl",
+                    match=MatchText(text=query_dsl_regex),
+                )
+            ]
+        )
+
+    # 3. フィルタ付きベクトル検索（構造一致 → 意味的類似度ランキング）
+    results = _qdrant().search(
+        collection_name=_COLLECTION,
+        query_vector=query_vector,
+        query_filter=query_filter,
+        limit=top_k * 3,
+    )
+
+    # 4. 同一 arxiv_id の重複を排除（最高スコアを保持）
+    seen: dict[str, dict] = {}
+    for hit in results:
+        arxiv_id = hit.payload.get("arxiv_id", "")
+        if not arxiv_id:
+            continue
+        aid = arxiv_id
+        if aid not in seen or hit.score > seen[aid]["score"]:
+            seen[aid] = {
+                "arxiv_id": arxiv_id,
+                "score": hit.score,
+                "text": hit.payload.get("text", ""),
+                "smiles_dsl": hit.payload.get("smiles_dsl", ""),
+                "variables": hit.payload.get("variables", []),
+            }
+
+    # 5. スコア降順ソート → 上位 top_k 件
+    ranked = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+    logger.info(
+        "FANNS hybrid search: filter=%r, candidates=%d, unique=%d, returned=%d",
+        query_dsl_regex, len(results), len(seen), min(len(ranked), top_k),
+    )
+    return ranked[:top_k]

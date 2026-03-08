@@ -3,6 +3,7 @@
 Endpoints
 ---------
 GET  /api/search                        Search arXiv for papers.
+POST /api/search/structure              FANNS hybrid search (DSL regex + vector similarity).
 POST /api/fetch                         Download a paper PDF and store it in MinIO.
 POST /api/extract                       Submit async background extraction job.
 GET  /api/extract-status/{arxiv_id}     Poll extraction job status (pending/processing/completed/failed).
@@ -18,6 +19,7 @@ POST /api/patterns/register             Register a confirmed pattern to Qdrant/N
 POST /api/auth/register                 Register a new user (Neo4j User node, returns JWT).
 POST /api/auth/login                    Authenticate and return a JWT.
 GET  /api/auth/me                       Return the current user's profile (requires Bearer token).
+GET  /api/patterns/{pattern_id}/suggestions  Missing link suggestions for a pattern.
 GET  /healthz                           Health check.
 """
 
@@ -43,10 +45,17 @@ from metaweave import extractor as ext
 from metaweave.batch import run_pattern_evaluation_task
 from metaweave.chat import generate_chat_response
 from metaweave.db import get_driver
-from metaweave.embedder import embed_and_store_pattern
+from metaweave.embedder import embed_and_store_pattern, search_fanns_hybrid
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
-from metaweave.llm import get_client, get_settings
-from metaweave.schema import AbstractionPattern, PaperStructure, PatternMatch, StructureProposal
+from metaweave.llm import generate_missing_link_suggestions, get_client, get_settings
+from metaweave.schema import (
+    AbstractionPattern,
+    FieldSuggestion,
+    MissingLinkSuggestion,
+    PaperStructure,
+    PatternMatch,
+    StructureProposal,
+)
 from metaweave.storage import StorageManager
 
 logging.basicConfig(level=logging.INFO)
@@ -287,11 +296,57 @@ class PatternRegisterRequest(BaseModel):
     pattern: AbstractionPattern
 
 
+class SuggestionOut(BaseModel):
+    """A single field suggestion for Missing Link."""
+
+    field: str
+    reasoning: str
+    keywords: list[str]
+
+
+class MissingLinkSuggestionResponse(BaseModel):
+    """Response for GET /api/patterns/{pattern_id}/suggestions."""
+
+    pattern_id: str
+    pattern_name: str
+    suggestions: list[SuggestionOut]
+    cached: bool = False
+
+
 class PatternRegisterResponse(BaseModel):
     """Response for POST /api/patterns/register."""
 
     pattern_id: str
     status: str = "registered"
+
+
+# ---------------------------------------------------------------------------
+# FANNS structure search request / response models
+# ---------------------------------------------------------------------------
+
+class StructureSearchRequest(BaseModel):
+    """Request body for POST /api/search/structure."""
+
+    query_dsl_regex: str = ""
+    query_text: str = ""
+    top_k: int = 5
+
+
+class StructureSearchHit(BaseModel):
+    """A single result from the FANNS hybrid search."""
+
+    arxiv_id: str
+    score: float
+    text: str
+    smiles_dsl: str = ""
+    variables: list[str] = []
+
+
+class StructureSearchResponse(BaseModel):
+    """Response for POST /api/search/structure."""
+
+    hits: list[StructureSearchHit]
+    total: int
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +505,156 @@ def search(
         )
         for m in results
     ]
+
+
+@app.post("/api/search/structure", response_model=StructureSearchResponse)
+def search_structure(body: StructureSearchRequest) -> StructureSearchResponse:
+    """FANNS ハイブリッド検索エンドポイント。
+
+    正規表現ベースの DSL パターンフィルタと自然言語クエリのベクトル検索を
+    組み合わせて、構造的に類似する論文を返す。
+
+    - ``query_dsl_regex``: SMILES DSL ペイロードに対する正規表現（例: ``"Agent.*Resource"``）
+    - ``query_text``: 意味的類似度検索用の自然言語クエリ
+    - ``top_k``: 返却する上位件数（デフォルト 5）
+
+    少なくとも ``query_dsl_regex`` か ``query_text`` のいずれか一方は必須。
+    """
+    if not body.query_dsl_regex and not body.query_text:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one of 'query_dsl_regex' or 'query_text' must be provided.",
+        )
+
+    try:
+        results = search_fanns_hybrid(
+            query_dsl_regex=body.query_dsl_regex,
+            query_text=body.query_text,
+            top_k=body.top_k,
+        )
+    except Exception as exc:
+        logger.exception("FANNS structure search failed")
+        raise HTTPException(
+            status_code=500, detail=f"Structure search failed: {exc}"
+        ) from exc
+
+    hits = [
+        StructureSearchHit(
+            arxiv_id=r["arxiv_id"],
+            score=r["score"],
+            text=r["text"],
+            smiles_dsl=r.get("smiles_dsl", ""),
+            variables=r.get("variables", []),
+        )
+        for r in results
+    ]
+
+    return StructureSearchResponse(hits=hits, total=len(hits))
+
+
+# ---------------------------------------------------------------------------
+# Natural Language → SMILES DSL conversion
+# ---------------------------------------------------------------------------
+
+class NlToDslRequest(BaseModel):
+    """Request body for POST /api/search/nl-to-dsl."""
+
+    natural_language_query: str
+
+
+class NlToDslResponse(BaseModel):
+    """Response for POST /api/search/nl-to-dsl."""
+
+    query_dsl_regex: str
+    explanation: str
+
+
+_NL_TO_DSL_PROMPT = """\
+あなたは MetaWeave の構造検索アシスタントです。
+ユーザーが自然言語で述べた課題・疑問を、MetaWeave-SMILES DSL の正規表現パターンに変換してください。
+
+## MetaWeave-SMILES DSL の書式
+- 変数: [略号:概念名:オントロジータイプ]  例: [a:Agent:Organization]
+- 因果辺: -[relation:polarity]->  例: -[cause:+]->
+- オントロジータイプ: Agent, Resource, Event, Purpose, InstitutionalAgent, IntentionalMoment
+
+## 出力ルール
+1. Qdrant の payload テキスト検索 (部分一致) に適した正規表現を生成する
+2. ワイルドカード (.*) を活用し、具体的なドメイン用語ではなく抽象的な構造パターンを捉える
+3. 複数のパターンが考えられる場合は、最も包括的な1つを選ぶ
+4. 出力は JSON 形式で返す: {"query_dsl_regex": "<正規表現>", "explanation": "<日本語での簡潔な説明>"}
+
+## 例
+入力: "限られた資源を複数の主体が奪い合う問題"
+出力: {"query_dsl_regex": "\\\\[.*:Agent\\\\].*-\\\\[.*compete.*\\\\]->.*\\\\[.*:Resource\\\\]", "explanation": "複数のエージェントがリソースを巡って競合する構造パターン"}
+
+入力: "技術革新が既存のビジネスモデルを破壊する現象"
+出力: {"query_dsl_regex": "\\\\[.*:Event\\\\].*-\\\\[.*destroy.*:-\\\\]->.*\\\\[.*:Resource\\\\]", "explanation": "イベント（技術革新）がリソース（ビジネスモデル）を負の方向に変化させる構造"}
+"""
+
+
+@app.post("/api/search/nl-to-dsl", response_model=NlToDslResponse)
+def nl_to_dsl(body: NlToDslRequest) -> NlToDslResponse:
+    """自然言語クエリを MetaWeave-SMILES DSL 正規表現に変換する。
+
+    LLM を使い、ユーザーの課題記述を Qdrant ペイロード検索互換の
+    DSL 正規表現に変換して返す。
+    """
+    if not body.natural_language_query.strip():
+        raise HTTPException(status_code=400, detail="natural_language_query is required.")
+
+    client = get_client()
+    settings = get_settings()
+
+    try:
+        response = client.chat.completions.create(
+            model=settings.analysis_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"{_NL_TO_DSL_PROMPT}\n\n"
+                        f"入力: \"{body.natural_language_query}\"\n"
+                        "出力:"
+                    ),
+                },
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+
+        # JSON 部分を抽出（コードブロック記法に対応）
+        if "```" in raw:
+            # ```json ... ``` or ``` ... ```
+            import re as _re
+            _match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, _re.DOTALL)
+            if _match:
+                raw = _match.group(1)
+        elif raw.startswith("{"):
+            pass  # already JSON
+        else:
+            # 行内の最初の { ... } を抜き出す
+            import re as _re
+            _match = _re.search(r"\{.*\}", raw, _re.DOTALL)
+            if _match:
+                raw = _match.group(0)
+
+        parsed = json.loads(raw)
+        return NlToDslResponse(
+            query_dsl_regex=parsed.get("query_dsl_regex", ""),
+            explanation=parsed.get("explanation", ""),
+        )
+    except json.JSONDecodeError:
+        logger.warning("NL-to-DSL: LLM response was not valid JSON: %s", raw)
+        # フォールバック: raw テキストをそのまま regex として返す
+        return NlToDslResponse(
+            query_dsl_regex=raw[:500] if raw else "",
+            explanation="LLM出力のJSON解析に失敗しました。手動で調整してください。",
+        )
+    except Exception as exc:
+        logger.exception("NL-to-DSL conversion failed")
+        raise HTTPException(
+            status_code=500, detail=f"NL-to-DSL conversion failed: {exc}"
+        ) from exc
 
 
 @app.post("/api/fetch", response_model=FetchResponse)
@@ -1189,3 +1394,146 @@ def get_paper_patterns(arxiv_id: str) -> PaperPatternListResponse:
     ]
 
     return PaperPatternListResponse(matches=matches)
+
+
+# ---------------------------------------------------------------------------
+# Missing Link Suggestion endpoint
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/patterns/{pattern_id}/suggestions",
+    response_model=MissingLinkSuggestionResponse,
+)
+def get_pattern_suggestions(
+    pattern_id: str,
+    refresh: bool = Query(False, description="Force re-generation ignoring cache"),
+) -> MissingLinkSuggestionResponse:
+    """パターンの構造的空白を検知し、異分野への検索サジェストを生成する。
+
+    結果は Neo4j にキャッシュし、再呼び出し時はキャッシュを返す。
+    ``refresh=true`` でキャッシュを無視して再生成する。
+    """
+
+    driver = get_driver()
+
+    # ── 1. Neo4j からパターンメタデータを取得 ──────────────────────────────
+    with driver.session() as session:
+        record = session.run(
+            """
+            MATCH (ap:AbstractionPattern {pattern_id: $pid})
+            RETURN ap.name               AS name,
+                   ap.description         AS description,
+                   ap.variables_template  AS variables_template,
+                   ap.structural_rules    AS structural_rules,
+                   ap.source_arxiv_id     AS source_arxiv_id
+            """,
+            pid=pattern_id,
+        ).single()
+
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Pattern '{pattern_id}' not found")
+
+    pat_name = record.get("name", "")
+    pat_desc = record.get("description", "")
+    vt_raw = record.get("variables_template", "[]")
+    sr_raw = record.get("structural_rules", "[]")
+
+    try:
+        variables_template = json.loads(vt_raw) if isinstance(vt_raw, str) else (vt_raw or [])
+    except Exception:
+        variables_template = []
+    try:
+        structural_rules = json.loads(sr_raw) if isinstance(sr_raw, str) else (sr_raw or [])
+    except Exception:
+        structural_rules = []
+
+    # ── 2. キャッシュ確認（refresh=false のとき） ─────────────────────────
+    if not refresh:
+        with driver.session() as session:
+            cached = session.run(
+                """
+                MATCH (ap:AbstractionPattern {pattern_id: $pid})
+                      -[:HAS_SUGGESTIONS]->(s:MissingLinkSuggestion)
+                RETURN s.suggestions_json AS suggestions_json
+                """,
+                pid=pattern_id,
+            ).single()
+        if cached and cached.get("suggestions_json"):
+            try:
+                cached_data = json.loads(cached["suggestions_json"])
+                return MissingLinkSuggestionResponse(
+                    pattern_id=pattern_id,
+                    pattern_name=pat_name,
+                    suggestions=[SuggestionOut(**s) for s in cached_data],
+                    cached=True,
+                )
+            except Exception:
+                logger.warning("Failed to parse cached suggestions for %s, regenerating", pattern_id)
+
+    # ── 3. 既にカバーされている分野を収集 ─────────────────────────────────
+    existing_fields: list[str] = []
+    with driver.session() as session:
+        matched_records = session.run(
+            """
+            MATCH (p:Paper)-[:MATCHES_PATTERN|HAS_PATTERN]->
+                  (ap:AbstractionPattern {pattern_id: $pid})
+            RETURN DISTINCT p.categories AS categories
+            """,
+            pid=pattern_id,
+        ).data()
+    for mr in matched_records:
+        cats = mr.get("categories")
+        if cats:
+            if isinstance(cats, str):
+                try:
+                    cats = json.loads(cats)
+                except Exception:
+                    cats = [cats]
+            if isinstance(cats, list):
+                existing_fields.extend(cats)
+
+    # ── 4. LLM で Missing Link サジェストを生成 ──────────────────────────
+    try:
+        result = generate_missing_link_suggestions(
+            pattern_name=pat_name,
+            pattern_description=pat_desc,
+            structural_rules=structural_rules,
+            variables_template=variables_template,
+            existing_fields=list(set(existing_fields)) if existing_fields else None,
+        )
+    except Exception as exc:
+        logger.exception("Missing link suggestion failed for %s", pattern_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Suggestion generation failed: {exc}",
+        ) from exc
+
+    suggestions = result.get("suggestions", [])
+
+    # ── 5. Neo4j にキャッシュ保存 ────────────────────────────────────────
+    try:
+        with driver.session() as session:
+            session.run(
+                """
+                MATCH (ap:AbstractionPattern {pattern_id: $pid})
+                OPTIONAL MATCH (ap)-[r:HAS_SUGGESTIONS]->(old:MissingLinkSuggestion)
+                DELETE r, old
+                WITH ap
+                CREATE (s:MissingLinkSuggestion {
+                    suggestions_json: $sj,
+                    created_at: datetime()
+                })
+                CREATE (ap)-[:HAS_SUGGESTIONS]->(s)
+                """,
+                pid=pattern_id,
+                sj=json.dumps(suggestions, ensure_ascii=False),
+            )
+    except Exception:
+        logger.warning("Failed to cache suggestions for %s", pattern_id, exc_info=True)
+
+    return MissingLinkSuggestionResponse(
+        pattern_id=pattern_id,
+        pattern_name=pat_name,
+        suggestions=[SuggestionOut(**s) for s in suggestions],
+        cached=False,
+    )

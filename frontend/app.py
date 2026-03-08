@@ -63,6 +63,20 @@ if "draft_papers" not in st.session_state:
 # パターンプレビュー結果: arxiv_id -> pattern dict
 if "pattern_preview" not in st.session_state:
     st.session_state.pattern_preview: dict[str, dict] = {}
+# Cross-Domain Search 用の状態
+if "xd_query" not in st.session_state:
+    st.session_state.xd_query: str = ""
+if "xd_dsl_regex" not in st.session_state:
+    st.session_state.xd_dsl_regex: str = ""
+if "xd_explanation" not in st.session_state:
+    st.session_state.xd_explanation: str = ""
+if "xd_results" not in st.session_state:
+    st.session_state.xd_results: list[dict] = []
+if "xd_searched" not in st.session_state:
+    st.session_state.xd_searched: bool = False
+# Missing Link Suggestion キャッシュ: pattern_id -> suggestion response dict
+if "missing_link_suggestions" not in st.session_state:
+    st.session_state.missing_link_suggestions: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +350,34 @@ def api_save_draft(arxiv_id: str, structure: dict) -> dict:
     return resp.json()
 
 
+def api_nl_to_dsl(natural_language_query: str) -> dict:
+    """POST /api/search/nl-to-dsl — convert natural language to SMILES DSL regex."""
+    resp = requests.post(
+        f"{BACKEND_URL}/api/search/nl-to-dsl",
+        json={"natural_language_query": natural_language_query},
+        headers=_auth_headers(),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()  # {query_dsl_regex, explanation}
+
+
+def api_search_structure(query_dsl_regex: str, query_text: str, top_k: int = 10) -> dict:
+    """POST /api/search/structure — FANNS hybrid search."""
+    resp = requests.post(
+        f"{BACKEND_URL}/api/search/structure",
+        json={
+            "query_dsl_regex": query_dsl_regex,
+            "query_text": query_text,
+            "top_k": top_k,
+        },
+        headers=_auth_headers(),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()  # {hits: [...], total: int}
+
+
 def api_register_pattern(pattern: dict) -> dict:
     """POST /api/patterns/register — register a confirmed pattern to Qdrant/Neo4j."""
     resp = requests.post(
@@ -346,6 +388,21 @@ def api_register_pattern(pattern: dict) -> dict:
     )
     resp.raise_for_status()
     return resp.json()  # {pattern_id, status: "registered"}
+
+
+def api_get_missing_link_suggestions(pattern_id: str, refresh: bool = False) -> dict:
+    """GET /api/patterns/{pattern_id}/suggestions — fetch missing link suggestions."""
+    params = {}
+    if refresh:
+        params["refresh"] = "true"
+    resp = requests.get(
+        f"{BACKEND_URL}/api/patterns/{pattern_id}/suggestions",
+        params=params,
+        headers=_auth_headers(),
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _auth_post(path: str, payload: dict) -> dict:
@@ -494,7 +551,7 @@ with _user_col:
 with st.sidebar:
     st.markdown("## MetaWeave v1")
     st.caption(f"👤 {st.session_state.username}")
-    page = st.radio("Navigation", ["Harvester Dashboard", "Validation View", "Pattern Library"])
+    page = st.radio("Navigation", ["Harvester Dashboard", "Validation View", "Pattern Library", "Cross-Domain Search"])
 
     if page == "Validation View":
         st.divider()
@@ -1242,3 +1299,260 @@ elif page == "Pattern Library":
                         )
                     except Exception:
                         st.caption("情報の取得に失敗しました。")
+
+                # ── Missing Link Suggestion ──────────────────────────
+                with st.expander("Missing Link Suggestion"):
+                    st.caption(
+                        "AIがこのパターンの「構造的空白」を検知し、"
+                        "まだカバーされていない分野への検索キーワードを提案します。"
+                    )
+
+                    _sug_col1, _sug_col2, _ = st.columns([1, 1, 4])
+                    with _sug_col1:
+                        _sug_fetch = st.button(
+                            "Suggest",
+                            key=f"btn_suggest_{_pat_id}",
+                            use_container_width=True,
+                            type="primary",
+                        )
+                    with _sug_col2:
+                        _sug_refresh = st.button(
+                            "Re-generate",
+                            key=f"btn_suggest_refresh_{_pat_id}",
+                            use_container_width=True,
+                        )
+
+                    if _sug_fetch or _sug_refresh:
+                        with st.spinner("AIが構造的空白を分析中…"):
+                            try:
+                                _sug_data = api_get_missing_link_suggestions(
+                                    _pat_id, refresh=_sug_refresh,
+                                )
+                                st.session_state.missing_link_suggestions[_pat_id] = _sug_data
+                            except Exception as _sug_exc:
+                                st.error(f"サジェスト生成に失敗しました: {_sug_exc}")
+
+                    _sug_cached = st.session_state.missing_link_suggestions.get(_pat_id)
+                    if _sug_cached:
+                        if _sug_cached.get("cached"):
+                            st.info("キャッシュされた結果を表示しています。「Re-generate」で再生成できます。")
+
+                        for _si, _sug in enumerate(_sug_cached.get("suggestions", [])):
+                            _sug_field = _sug.get("field", "")
+                            _sug_reason = _sug.get("reasoning", "")
+                            _sug_kws = _sug.get("keywords", [])
+
+                            st.markdown(f"**{_si + 1}. {_sug_field}**")
+                            st.markdown(f"  {_sug_reason}")
+
+                            if _sug_kws:
+                                _kw_cols = st.columns(min(len(_sug_kws), 4))
+                                for _ki, _kw in enumerate(_sug_kws):
+                                    with _kw_cols[_ki % len(_kw_cols)]:
+                                        if st.button(
+                                            f"Search: {_kw}",
+                                            key=f"btn_kw_{_pat_id}_{_si}_{_ki}",
+                                            use_container_width=True,
+                                        ):
+                                            # arXiv 検索画面に遷移して検索を実行
+                                            st.session_state.search_results = []
+                                            try:
+                                                _kw_resp = requests.get(
+                                                    f"{BACKEND_URL}/api/search",
+                                                    params={"q": _kw, "max_results": 10},
+                                                    headers=_auth_headers(),
+                                                    timeout=30,
+                                                )
+                                                _kw_resp.raise_for_status()
+                                                st.session_state.search_results = _kw_resp.json()
+                                                st.toast(f"「{_kw}」で {len(st.session_state.search_results)} 件見つかりました")
+                                            except Exception as _kw_exc:
+                                                st.error(f"検索に失敗しました: {_kw_exc}")
+
+                            st.divider()
+
+# =========================================================================
+# Page D — Cross-Domain Search (分野横断構造検索)
+# =========================================================================
+elif page == "Cross-Domain Search":
+    st.header("Cross-Domain Search")
+    st.caption(
+        "自然言語で課題を入力すると、構造的に類似した異分野の論文を発見できます。"
+        " MetaWeave-SMILES DSL ベースの FANNS ハイブリッド検索を利用しています。"
+    )
+
+    # ── Step 1: 自然言語入力 ─────────────────────────────────────────────
+    st.markdown("### 1. 課題を入力")
+    xd_nl_input = st.text_area(
+        "あなたの課題・疑問を自然言語で記述してください",
+        value=st.session_state.xd_query,
+        height=120,
+        placeholder="例: 限られた資源を複数の主体が奪い合う問題を解決したい",
+        key="xd_nl_input",
+    )
+
+    _convert_col, _clear_col, _ = st.columns([1, 1, 4])
+    with _convert_col:
+        xd_convert_btn = st.button(
+            "DSL に変換",
+            use_container_width=True,
+            type="primary",
+            key="btn_xd_convert",
+        )
+    with _clear_col:
+        xd_clear_btn = st.button(
+            "クリア",
+            use_container_width=True,
+            key="btn_xd_clear",
+        )
+
+    if xd_clear_btn:
+        st.session_state.xd_query = ""
+        st.session_state.xd_dsl_regex = ""
+        st.session_state.xd_explanation = ""
+        st.session_state.xd_results = []
+        st.session_state.xd_searched = False
+        st.rerun()
+
+    if xd_convert_btn and xd_nl_input.strip():
+        st.session_state.xd_query = xd_nl_input.strip()
+        with st.spinner("LLM で構造パターン (DSL) に変換中…"):
+            try:
+                _dsl_resp = api_nl_to_dsl(xd_nl_input.strip())
+                st.session_state.xd_dsl_regex = _dsl_resp.get("query_dsl_regex", "")
+                st.session_state.xd_explanation = _dsl_resp.get("explanation", "")
+                st.session_state.xd_searched = False
+                st.rerun()
+            except Exception as exc:
+                st.error(f"DSL 変換に失敗しました: {exc}")
+
+    # ── Step 2: DSL 編集フィールド ───────────────────────────────────────
+    if st.session_state.xd_dsl_regex or st.session_state.xd_explanation:
+        st.divider()
+        st.markdown("### 2. DSL パターンを確認・編集")
+
+        if st.session_state.xd_explanation:
+            st.info(f"**LLM の解釈:** {st.session_state.xd_explanation}")
+
+        xd_dsl_edited = st.text_area(
+            "MetaWeave-SMILES DSL 正規表現 (編集可能)",
+            value=st.session_state.xd_dsl_regex,
+            height=80,
+            key="xd_dsl_edit",
+        )
+
+        xd_query_text = st.text_input(
+            "補助テキストクエリ (意味的類似度検索、任意)",
+            value=st.session_state.xd_query,
+            key="xd_query_text",
+        )
+
+        _top_k_col, _search_col, _ = st.columns([1, 1, 4])
+        with _top_k_col:
+            xd_top_k = st.number_input(
+                "最大件数",
+                min_value=1,
+                max_value=50,
+                value=10,
+                key="xd_top_k",
+            )
+        with _search_col:
+            st.markdown("")  # spacer for alignment
+            xd_search_btn = st.button(
+                "構造検索を実行",
+                use_container_width=True,
+                type="primary",
+                key="btn_xd_search",
+            )
+
+        if xd_search_btn:
+            if not xd_dsl_edited.strip() and not xd_query_text.strip():
+                st.warning("DSL パターンまたはテキストクエリのいずれかを入力してください。")
+            else:
+                st.session_state.xd_dsl_regex = xd_dsl_edited.strip()
+                with st.spinner("FANNS ハイブリッド検索を実行中…"):
+                    try:
+                        _search_resp = api_search_structure(
+                            query_dsl_regex=xd_dsl_edited.strip(),
+                            query_text=xd_query_text.strip(),
+                            top_k=int(xd_top_k),
+                        )
+                        st.session_state.xd_results = _search_resp.get("hits", [])
+                        st.session_state.xd_searched = True
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"構造検索に失敗しました: {exc}")
+
+    # ── Step 3: 検索結果表示 ─────────────────────────────────────────────
+    if st.session_state.xd_searched:
+        st.divider()
+        st.markdown("### 3. 検索結果")
+
+        _hits = st.session_state.xd_results
+        if not _hits:
+            st.warning(
+                "構造的に一致する論文が見つかりませんでした。\n\n"
+                "**ヒント:** DSL パターンのワイルドカード (`.*`) を増やして"
+                "抽象度を上げるか、補助テキストクエリを追加してみてください。"
+            )
+        else:
+            st.success(f"{len(_hits)} 件の構造的に類似した論文が見つかりました。")
+
+            for _hi, _hit in enumerate(_hits):
+                _h_arxiv = _hit.get("arxiv_id", "")
+                _h_score = _hit.get("score", 0.0)
+                _h_text = _hit.get("text", "")
+                _h_smiles = _hit.get("smiles_dsl", "")
+                _h_vars = _hit.get("variables", [])
+
+                with st.container(border=True):
+                    _h_left, _h_right = st.columns([4, 1])
+
+                    with _h_left:
+                        # タイトルを取得（メタデータがあれば使う、なければarXiv ID）
+                        _h_title = (
+                            st.session_state.paper_metadata.get(_h_arxiv, {}).get("title")
+                            or st.session_state.structures.get(_h_arxiv, {}).get("title")
+                            or _h_arxiv
+                        )
+                        st.markdown(f"**{_h_title}**")
+                        st.caption(f"arXiv ID: `{_h_arxiv}`")
+
+                        if _h_text:
+                            _preview_text = _h_text[:300] + ("…" if len(_h_text) > 300 else "")
+                            st.markdown(f"> {_preview_text}")
+
+                        if _h_smiles:
+                            st.code(_h_smiles, language=None)
+
+                        if _h_vars:
+                            st.markdown(
+                                "**Variables:** "
+                                + ", ".join(f"`{v}`" for v in _h_vars)
+                            )
+
+                    with _h_right:
+                        st.metric("Score", f"{_h_score:.3f}")
+
+                        # Validation View へのナビゲーション
+                        if st.button(
+                            "詳細を見る",
+                            key=f"xd_detail_{_hi}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.active_paper_id = _h_arxiv
+                            # stored_papers に登録されていなければ追加
+                            if _h_arxiv not in st.session_state.stored_papers:
+                                try:
+                                    _remote_papers = api_list_papers()
+                                    for _rp in _remote_papers:
+                                        _rp_id = _rp.rsplit("/", 1)[-1].replace(".pdf", "")
+                                        if _rp_id == _h_arxiv:
+                                            st.session_state.stored_papers[_h_arxiv] = _rp
+                                            break
+                                except Exception:
+                                    pass
+                            st.info(
+                                f"サイドバーの Navigation で **Validation View** を選択し、"
+                                f"論文 `{_h_arxiv}` の詳細を確認してください。"
+                            )
