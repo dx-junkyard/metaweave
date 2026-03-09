@@ -350,21 +350,33 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
         "=== MetaWeave-SMILES DSL Instructions ===\n"
         "You MUST encode all extracted causal relationships (CausalEdge) and variables "
         "into the MetaWeave-SMILES DSL and store the result in abstract_structure.smiles_dsl.\n\n"
-        "DSL syntax:\n"
-        "  [variableID:OntologyType:concreteValue] -[relationType:polarity]-> [targetVariableID:OntologyType:concreteValue]\n"
-        "Example:\n"
-        "  [a:Agent:Toyota] -[causes:+]-> [r:Resource:Profit]\n\n"
+        "=== Core vs. Peripheral Edge Classification ===\n"
+        "Each CausalEdge must be classified as either CORE or PERIPHERAL:\n"
+        "- CORE (is_core=true): Backbone mechanisms essential to the paper's main argument. "
+        "These represent the fundamental causal chain without which the paper's thesis collapses.\n"
+        "- PERIPHERAL (is_core=false): Supplementary, contextual, or domain-specific relationships "
+        "that provide supporting detail but are not essential to the core mechanism.\n\n"
+        "DSL syntax (IMPORTANT — different connectors for core vs. peripheral):\n"
+        "  Core edge:       [varID:OntologyType:value] ==[relationType:polarity]=> [targetVarID:OntologyType:value]\n"
+        "  Peripheral edge: [varID:OntologyType:value] -[relationType:polarity]-> [targetVarID:OntologyType:value]\n\n"
+        "Examples:\n"
+        "  Core:       [a:Agent:Toyota] ==[causes:+]=> [r:Resource:Profit]\n"
+        "  Peripheral: [e:Event:MarketShift] -[correlates:+]-> [r:Resource:Profit]\n\n"
         "Rules:\n"
         "1. Each variable must be assigned an OntologyType from the following: "
         "Agent, Resource, Event, Purpose-oriented group, Institutional Agent, Intentional Moment.\n"
         "2. Each CausalEdge must specify polarity (+ or -) in both the edge's polarity field "
         "and the DSL string.\n"
         "3. Each CausalEdge must specify ontology_level with the relevant ontology relation type.\n"
-        "4. If there is a cycle (loop) among variables, reuse the variable ID "
+        "4. Each CausalEdge must set is_core=true for core edges and is_core=false for peripheral edges. "
+        "Use ==[…]=> in the DSL for core edges and -[…]-> for peripheral edges.\n"
+        "5. If there is a cycle (loop) among variables, reuse the variable ID "
         "without repeating the full declaration (e.g., [a] instead of [a:Agent:Toyota]).\n"
-        "5. Chain multiple edges with spaces: "
-        "[a:Agent:X] -[causes:+]-> [r:Resource:Y] [r] -[inhibits:-]-> [a]\n"
-        "6. Classify all extraction targets strictly according to OntologyType.\n"
+        "6. Chain multiple edges with spaces: "
+        "[a:Agent:X] ==[causes:+]=> [r:Resource:Y] [r] -[inhibits:-]-> [a]\n"
+        "7. Classify all extraction targets strictly according to OntologyType.\n"
+        "8. Aim for roughly 30-50%% of edges to be core. If all edges seem equally important, "
+        "select only the most fundamental causal chain as core.\n"
     )
 
     resp = client.beta.chat.completions.parse(
@@ -724,15 +736,33 @@ def extract_abstraction_pattern(structure: PaperStructure) -> AbstractionPattern
     client = get_client()
     settings = get_settings()
 
+    # Core edges のみを優先して抽出データを構築
+    core_edges = [e for e in structure.abstract_structure.edges if e.is_core]
+    peripheral_edges = [e for e in structure.abstract_structure.edges if not e.is_core]
+
+    core_edges_desc = "\n".join(
+        f"  - {e.source} {e.relation}({e.polarity}) {e.target}" for e in core_edges
+    ) or "  (none)"
+    peripheral_edges_desc = "\n".join(
+        f"  - {e.source} {e.relation}({e.polarity}) {e.target}" for e in peripheral_edges
+    ) or "  (none)"
+
     prompt = (
         "あなたはメタ構造転写エンジンの一部です。\n"
         "以下の論文構造データから、具体的な事象を「変数（X, Y, Z等）」に置き換え、\n"
         "分野横断で適用可能な汎用的な「問題解決の型（Abstraction Pattern）」を抽出してください。\n\n"
+        "【重要：Core Edge 優先】\n"
+        "論文の因果グラフには Core（骨格メカニズム）と Peripheral（補足要素）の区別があります。\n"
+        "パターン抽出では Core edges を最優先で structural_rules に反映し、\n"
+        "Peripheral edges は補足情報として参考にしつつ、パターンの本質に含めないでください。\n\n"
+        f"--- Core Edges (骨格メカニズム) ---\n{core_edges_desc}\n\n"
+        f"--- Peripheral Edges (補足要素) ---\n{peripheral_edges_desc}\n\n"
         "【ルール】\n"
         "- name: パターンの簡潔な名称（英語、20語以内）\n"
         "- description: パターンの説明（具体的なドメイン用語は使わず、抽象変数で記述）\n"
         "- variables_template: パターン内で使われる抽象変数のリスト（例: [\"X\", \"Y\", \"Z\"]）\n"
-        "- structural_rules: 変数間の関係ルール（例: [\"X inhibits Y\", \"Y enables Z\"]）\n\n"
+        "- structural_rules: 変数間の関係ルール（例: [\"X inhibits Y\", \"Y enables Z\"]）。\n"
+        "  Core edges のみから structural_rules を構成してください。\n\n"
         f"--- 論文構造データ ---\n{structure.model_dump_json(indent=2)}\n\n"
         f'source_arxiv_id は "{structure.paper_id}" を設定してください。\n'
         "JSONスキーマに厳格に従って出力してください。"
