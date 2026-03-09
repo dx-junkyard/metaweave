@@ -185,13 +185,16 @@ def api_list_papers() -> list[str]:
 
 
 def api_extract(
-    object_name: str, arxiv_id: str, is_draft: bool = False, user_id: str | None = None
+    object_name: str, arxiv_id: str, is_draft: bool = False, user_id: str | None = None,
+    license: str = "",
 ) -> dict:
     """POST /api/extract — submit async job, returns {arxiv_id, status: "pending"}."""
     payload: dict = {"object_name": object_name, "arxiv_id": arxiv_id}
     if is_draft:
         payload["is_draft"] = True
         payload["user_id"] = user_id
+    if license:
+        payload["license"] = license
     resp = requests.post(
         f"{BACKEND_URL}/api/extract",
         json=payload,
@@ -677,7 +680,7 @@ if page == "Harvester Dashboard":
                                 st.session_state.stored_papers[arxiv_id] = object_name
                                 st.session_state.paper_metadata[arxiv_id] = meta
                             # 非同期抽出ジョブをキュー登録（即時返答）
-                            api_extract(object_name, arxiv_id)
+                            api_extract(object_name, arxiv_id, license=meta.get("license", ""))
                             st.session_state.processing_papers[arxiv_id] = {
                                 "title": meta.get("title", arxiv_id),
                                 "object_name": object_name,
@@ -963,6 +966,7 @@ elif page == "Validation View":
                         updated: dict = {
                             "paper_id": active_id,
                             "title": s.get("title", ""),
+                            "license": s.get("license", ""),
                             "problem": {"background": bg, "problem": prob},
                             "hypothesis": {"statement": hyp_stmt, "rationale": hyp_rat},
                             "methodology": {

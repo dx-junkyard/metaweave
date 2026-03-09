@@ -141,6 +141,7 @@ class ExtractRequest(BaseModel):
     is_draft: bool = False
     user_id: str | None = None
     skip_embedding: bool = False
+    license: str = ""
 
 
 class ExtractAccepted(BaseModel):
@@ -396,6 +397,7 @@ def _run_extraction_task(
     is_draft: bool = False,
     user_id: str | None = None,
     skip_embedding: bool = False,
+    license: str = "",
 ) -> None:
     """バックグラウンドで実行される抽出タスク。
 
@@ -425,6 +427,7 @@ def _run_extraction_task(
         text = ext.extract_text_from_pdf_bytes(pdf_bytes)
         structure = ext.extract_paper_structure(
             text, paper_id=arxiv_id, skip_embedding=skip_embedding, pdf_bytes=pdf_bytes,
+            license=license,
         )
 
         if is_draft and user_id:
@@ -705,6 +708,7 @@ def extract(body: ExtractRequest, background_tasks: BackgroundTasks) -> ExtractA
         is_draft=body.is_draft,
         user_id=body.user_id,
         skip_embedding=effective_skip_embedding,
+        license=body.license,
     )
     logger.info(
         "Extraction job queued for %s (is_draft=%s, skip_embedding=%s)",

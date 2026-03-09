@@ -325,7 +325,7 @@ def _refine_with_chunk(state: _AnalysisState, chunk: str, chunk_idx: int) -> Non
     logger.debug("Chunk %d refined for state", chunk_idx)
 
 
-def _finalize_structure(state: _AnalysisState, paper_id: str) -> PaperStructure:
+def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "") -> PaperStructure:
     """蓄積された分析状態から最終的な PaperStructure を生成する。"""
     client = get_client()
     settings = get_settings()
@@ -373,7 +373,7 @@ def _finalize_structure(state: _AnalysisState, paper_id: str) -> PaperStructure:
         response_format=PaperStructure,
     )
     structure: PaperStructure = resp.choices[0].message.parsed
-    return structure.model_copy(update={"paper_id": paper_id})
+    return structure.model_copy(update={"paper_id": paper_id, "license": license})
 
 
 def _embed_and_store_chunks(chunks: list[str], paper_id: str) -> None:
@@ -399,6 +399,7 @@ def extract_paper_structure(
     paper_id: str = "",
     skip_embedding: bool = False,
     pdf_bytes: bytes | None = None,
+    license: str = "",
 ) -> PaperStructure:
     """仮説検証型の逐次処理で論文テキストから PaperStructure を抽出する。
 
@@ -465,7 +466,7 @@ def extract_paper_structure(
 
         # Step 3: 最終評価
         logger.info("Finalizing structure for %s", paper_id)
-        structure = _finalize_structure(state, paper_id)
+        structure = _finalize_structure(state, paper_id, license=license)
 
     finally:
         # Embedding の完了を待つ（最大 90 秒、失敗しても続行）
