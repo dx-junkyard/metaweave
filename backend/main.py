@@ -571,29 +571,30 @@ class NlToDslResponse(BaseModel):
     query_dsl_regex: str
     explanation: str
 
-
 _NL_TO_DSL_PROMPT = """\
 あなたは MetaWeave の構造検索アシスタントです。
 ユーザーが自然言語で述べた課題・疑問を、MetaWeave-SMILES DSL の正規表現パターンに変換してください。
 
 ## MetaWeave-SMILES DSL の書式
 - 変数: [略号:概念名:オントロジータイプ]  例: [a:Agent:Organization]
-- 因果辺: -[relation:polarity]->  例: -[cause:+]->
+- コア因果辺（太線）: ==[relation:polarity]==>  例: ==[cause:+]==>
 - オントロジータイプ: Agent, Resource, Event, Purpose, InstitutionalAgent, IntentionalMoment
 
 ## 出力ルール
 1. Qdrant の payload テキスト検索 (部分一致) に適した正規表現を生成する
 2. ワイルドカード (.*) を活用し、具体的なドメイン用語ではなく抽象的な構造パターンを捉える
-3. 複数のパターンが考えられる場合は、最も包括的な1つを選ぶ
-4. 出力は JSON 形式で返す: {"query_dsl_regex": "<正規表現>", "explanation": "<日本語での簡潔な説明>"}
+3. 異分野検索の精度を上げるため、原則として論文の主眼である「コア因果辺（==[...]=>）」をターゲットとした正規表現を生成する
+4. 複数のパターンが考えられる場合は、最も包括的な1つを選ぶ
+5. 出力は JSON 形式で返す: {"query_dsl_regex": "<正規表現>", "explanation": "<日本語での簡潔な説明>"}
 
 ## 例
 入力: "限られた資源を複数の主体が奪い合う問題"
-出力: {"query_dsl_regex": "\\\\[.*:Agent\\\\].*-\\\\[.*compete.*\\\\]->.*\\\\[.*:Resource\\\\]", "explanation": "複数のエージェントがリソースを巡って競合する構造パターン"}
+出力: {"query_dsl_regex": "\\\\[.*:Agent\\\\].*==\\\\[.*compete.*\\\\]==>.*\\\\[.*:Resource\\\\]", "explanation": "複数のエージェントがリソースを巡って競合するコア構造パターン"}
 
 入力: "技術革新が既存のビジネスモデルを破壊する現象"
-出力: {"query_dsl_regex": "\\\\[.*:Event\\\\].*-\\\\[.*destroy.*:-\\\\]->.*\\\\[.*:Resource\\\\]", "explanation": "イベント（技術革新）がリソース（ビジネスモデル）を負の方向に変化させる構造"}
+出力: {"query_dsl_regex": "\\\\[.*:Event\\\\].*==\\\\[.*destroy.*:-\\\\]==>.*\\\\[.*:Resource\\\\]", "explanation": "イベント（技術革新）がリソース（ビジネスモデル）を負の方向に変化させるコア構造"}
 """
+
 
 
 @app.post("/api/search/nl-to-dsl", response_model=NlToDslResponse)

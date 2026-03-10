@@ -62,6 +62,10 @@ class CausalEdge(BaseModel):
     relation: str = Field(default="causes", description="Type of relation (causes, inhibits, correlates, ...)")
     polarity: str = Field(default="+", description="Causal polarity (+/-)")
     ontology_level: str = Field(default="", description="Ontology relation type (e.g., Intentional Moment)")
+    is_core: bool = Field(
+        default=True,
+        description="True for backbone/core mechanism edges, False for peripheral/supplementary edges",
+    )
 
 
 class AbstractStructure(BaseModel):

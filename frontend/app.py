@@ -862,6 +862,73 @@ elif page == "Validation View":
                             "🔄 **解析処理中です。** 完了後に構造データが表示されます。"
                         )
 
+                    # ── Causal Graph Visualization (outside form) ──
+                    _cg_edges = s["abstract_structure"].get("edges", [])
+                    _cg_vars = s["abstract_structure"].get("variables", [])
+                    if _cg_edges:
+                        with st.expander("🔗 Causal Graph (Core = thick, Peripheral = thin)", expanded=False):
+                            # Build vis-network HTML
+                            _vis_nodes = []
+                            _vis_node_ids = set()
+                            for _e in _cg_edges:
+                                for _v in (_e.get("source", ""), _e.get("target", "")):
+                                    if _v and _v not in _vis_node_ids:
+                                        _vis_node_ids.add(_v)
+                                        _vis_nodes.append({"id": _v, "label": _v})
+                            # Also add variables not in edges
+                            for _v in _cg_vars:
+                                if _v and _v not in _vis_node_ids:
+                                    _vis_node_ids.add(_v)
+                                    _vis_nodes.append({"id": _v, "label": _v})
+
+                            _vis_edges = []
+                            for _idx, _e in enumerate(_cg_edges):
+                                _is_core = _e.get("is_core", True)
+                                _vis_edges.append({
+                                    "from": _e.get("source", ""),
+                                    "to": _e.get("target", ""),
+                                    "label": f"{_e.get('relation', '')} ({_e.get('polarity', '+')})",
+                                    "width": 4 if _is_core else 1,
+                                    "color": "#2196F3" if _is_core else "#BDBDBD",
+                                    "dashes": False if _is_core else True,
+                                    "arrows": "to",
+                                })
+
+                            import json as _json_cg
+                            _vis_html = f"""
+                            <html>
+                            <head>
+                            <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+                            <style>
+                                #causal-graph {{ width: 100%; height: 420px; border: 1px solid #ccc; }}
+                                .legend {{ font-family: sans-serif; font-size: 13px; margin-top: 6px; }}
+                                .legend span {{ display: inline-block; width: 40px; height: 4px; vertical-align: middle; margin-right: 6px; }}
+                            </style>
+                            </head>
+                            <body>
+                            <div id="causal-graph"></div>
+                            <div class="legend">
+                                <span style="background:#2196F3;height:4px;"></span> Core (backbone)
+                                &nbsp;&nbsp;
+                                <span style="background:#BDBDBD;height:2px;border-top:1px dashed #BDBDBD;"></span> Peripheral (supplementary)
+                            </div>
+                            <script>
+                                var nodes = new vis.DataSet({_json_cg.dumps(_vis_nodes)});
+                                var edges = new vis.DataSet({_json_cg.dumps(_vis_edges)});
+                                var container = document.getElementById('causal-graph');
+                                var data = {{ nodes: nodes, edges: edges }};
+                                var options = {{
+                                    physics: {{ stabilization: true }},
+                                    edges: {{ font: {{ size: 11 }}, smooth: {{ type: 'cubicBezier' }} }},
+                                    nodes: {{ shape: 'box', font: {{ size: 14 }}, margin: 8 }}
+                                }};
+                                new vis.Network(container, data, options);
+                            </script>
+                            </body>
+                            </html>
+                            """
+                            components.html(_vis_html, height=480)
+
                     with st.form(f"structure_form_{active_id}"):
                         tab_dsl, tab1, tab2, tab3 = st.tabs(
                             ["🧬 SMILES DSL", "Problem / Hypothesis", "Method / Constraints", "Raw Variables & Edges"]
@@ -869,6 +936,9 @@ elif page == "Validation View":
 
                         with tab_dsl:
                             st.markdown("#### Abstract Structure — SMILES DSL")
+                            st.caption(
+                                "Core edges: `==[rel:pol]=>` (thick) / Peripheral edges: `-[rel:pol]->` (thin)"
+                            )
                             smiles_dsl = st.text_area(
                                 "MetaWeave-SMILES DSL",
                                 value=s["abstract_structure"].get("smiles_dsl", ""),

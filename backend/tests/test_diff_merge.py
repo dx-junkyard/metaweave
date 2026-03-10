@@ -354,3 +354,70 @@ class TestEvaluateAndMergeDiffBased:
         result = evaluate_and_merge_proposals(base, proposed)
 
         assert result.merged_structure.paper_id == "2401.00001"
+
+
+# ---------------------------------------------------------------------------
+# CausalEdge is_core field tests (Issue #45)
+# ---------------------------------------------------------------------------
+
+class TestCausalEdgeIsCore:
+    """CausalEdge の is_core フィールドに関するテスト。"""
+
+    def test_default_is_core_true(self):
+        """is_core のデフォルト値は True。"""
+        edge = CausalEdge(source="A", target="B")
+        assert edge.is_core is True
+
+    def test_is_core_false(self):
+        """is_core=False を明示指定できる。"""
+        edge = CausalEdge(source="A", target="B", is_core=False)
+        assert edge.is_core is False
+
+    def test_is_core_serialization(self):
+        """is_core が model_dump に含まれる。"""
+        edge = CausalEdge(source="A", target="B", relation="inhibits", polarity="-", is_core=False)
+        d = edge.model_dump()
+        assert "is_core" in d
+        assert d["is_core"] is False
+
+    def test_structure_with_mixed_core_edges(self):
+        """core と peripheral の混合エッジを含む PaperStructure を構築できる。"""
+        structure = _make_structure(
+            abstract_structure=AbstractStructure(
+                variables=["X", "Y", "Z"],
+                edges=[
+                    CausalEdge(source="X", target="Y", relation="causes", polarity="+", is_core=True),
+                    CausalEdge(source="Y", target="Z", relation="correlates", polarity="+", is_core=False),
+                ],
+                smiles_dsl="[x:Agent:X] ==[causes:+]=> [y:Resource:Y] [y] -[correlates:+]-> [z:Event:Z]",
+            )
+        )
+        core_edges = [e for e in structure.abstract_structure.edges if e.is_core]
+        peripheral_edges = [e for e in structure.abstract_structure.edges if not e.is_core]
+        assert len(core_edges) == 1
+        assert len(peripheral_edges) == 1
+        assert core_edges[0].source == "X"
+        assert peripheral_edges[0].source == "Y"
+
+    def test_is_core_change_detected_in_diff(self):
+        """is_core の変更が diff として検出される。"""
+        from metaweave.extractor import compute_structure_diff
+
+        base = _make_structure(
+            abstract_structure=AbstractStructure(
+                variables=["X", "Y"],
+                edges=[CausalEdge(source="X", target="Y", is_core=True)],
+                smiles_dsl="[x:Agent:X] ==[causes:+]=> [y:Resource:Y]",
+            )
+        )
+        proposed = _make_structure(
+            abstract_structure=AbstractStructure(
+                variables=["X", "Y"],
+                edges=[CausalEdge(source="X", target="Y", is_core=False)],
+                smiles_dsl="[x:Agent:X] -[causes:+]-> [y:Resource:Y]",
+            )
+        )
+        diffs = compute_structure_diff(base, proposed)
+        paths = {d.field_path for d in diffs}
+        assert "abstract_structure.edges" in paths
+        assert "abstract_structure.smiles_dsl" in paths
