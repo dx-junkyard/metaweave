@@ -356,12 +356,24 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
         "These represent the fundamental causal chain without which the paper's thesis collapses.\n"
         "- PERIPHERAL (is_core=false): Supplementary, contextual, or domain-specific relationships "
         "that provide supporting detail but are not essential to the core mechanism.\n\n"
+        "=== CorePredicate (標準述語) — MANDATORY ===\n"
+        "Each CausalEdge MUST set core_predicate to ONE of the following seven standardized values:\n"
+        "  CAUSES     → one variable directly produces or triggers another\n"
+        "  INHIBITS   → one variable suppresses, blocks, or reduces another\n"
+        "  CORRELATES → two variables co-vary without clear directionality\n"
+        "  DEFINES    → one variable characterizes, specifies, or constitutes another\n"
+        "  MEASURES   → one variable operationalizes or quantifies another\n"
+        "  TRANSFORMS → one variable converts or changes the state of another\n"
+        "  REQUIRES   → one variable depends on or presupposes another\n\n"
+        "Each CausalEdge MUST also set domain_verb to the original domain-specific verb "
+        "(e.g., 'operationalizes', 'structures', 'quantifies', 'induces').\n\n"
         "DSL syntax (IMPORTANT — different connectors for core vs. peripheral):\n"
-        "  Core edge:       [varID:OntologyType:value] ==[relationType:polarity]=> [targetVarID:OntologyType:value]\n"
-        "  Peripheral edge: [varID:OntologyType:value] -[relationType:polarity]-> [targetVarID:OntologyType:value]\n\n"
+        "  Core edge:       [varID:OntologyType:value] ==[CorePredicate:domain_verb:polarity]=> [targetVarID:OntologyType:value]\n"
+        "  Peripheral edge: [varID:OntologyType:value] -[CorePredicate:domain_verb:polarity]-> [targetVarID:OntologyType:value]\n\n"
         "Examples:\n"
-        "  Core:       [a:Agent:Toyota] ==[causes:+]=> [r:Resource:Profit]\n"
-        "  Peripheral: [e:Event:MarketShift] -[correlates:+]-> [r:Resource:Profit]\n\n"
+        "  Core:       [a:Agent:Toyota] ==[CAUSES:operationalizes:+]=> [r:Resource:Profit]\n"
+        "  Core:       [x:Event:Stress] ==[MEASURES:quantifies:+]=> [y:Resource:CortisalLevel]\n"
+        "  Peripheral: [e:Event:MarketShift] -[CORRELATES:correlates:+]-> [r:Resource:Profit]\n\n"
         "=== [PHASE 1 — ONTOLOGY ENFORCEMENT] OntologyType Mandatory Rules ===\n"
         "CRITICAL: Every single node in the DSL string MUST include OntologyType. "
         "Nodes without OntologyType are INVALID and must be rejected.\n\n"
@@ -392,10 +404,12 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
         "5. If there is a cycle (loop) among variables, reuse the variable ID "
         "without repeating the full declaration (e.g., [a] instead of [a:Agent:Toyota]).\n"
         "6. Chain multiple edges with spaces: "
-        "[a:Agent:X] ==[causes:+]=> [r:Resource:Y] [r] -[inhibits:-]-> [a]\n"
+        "[a:Agent:X] ==[CAUSES:operationalizes:+]=> [r:Resource:Y] [r] -[INHIBITS:suppresses:-]-> [a]\n"
         "7. Classify all extraction targets strictly according to OntologyType.\n"
         "8. Aim for roughly 30-50%% of edges to be core. If all edges seem equally important, "
         "select only the most fundamental causal chain as core.\n"
+        "9. CRITICAL: Every edge in the DSL string MUST use the new three-part format "
+        "[CorePredicate:domain_verb:polarity]. The old two-part format [relationType:polarity] is FORBIDDEN.\n"
     )
 
     resp = client.beta.chat.completions.parse(
@@ -760,10 +774,10 @@ def extract_abstraction_pattern(structure: PaperStructure) -> AbstractionPattern
     peripheral_edges = [e for e in structure.abstract_structure.edges if not e.is_core]
 
     core_edges_desc = "\n".join(
-        f"  - {e.source} {e.relation}({e.polarity}) {e.target}" for e in core_edges
+        f"  - {e.source} {e.core_predicate.value}:{e.domain_verb}({e.polarity}) {e.target}" for e in core_edges
     ) or "  (none)"
     peripheral_edges_desc = "\n".join(
-        f"  - {e.source} {e.relation}({e.polarity}) {e.target}" for e in peripheral_edges
+        f"  - {e.source} {e.core_predicate.value}:{e.domain_verb}({e.polarity}) {e.target}" for e in peripheral_edges
     ) or "  (none)"
 
     prompt = (

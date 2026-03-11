@@ -18,6 +18,7 @@ from metaweave.schema import (
     AbstractStructure,
     CausalEdge,
     Constraints,
+    CorePredicate,
     FieldDiff,
     Hypothesis,
     MergeResult,
@@ -58,9 +59,9 @@ def _make_structure(**overrides) -> PaperStructure:
         "abstract_structure": AbstractStructure(
             variables=["X", "Y"],
             edges=[
-                CausalEdge(source="X", target="Y", relation="causes", polarity="+"),
+                CausalEdge(source="X", target="Y", core_predicate=CorePredicate.CAUSES, domain_verb="causes", polarity="+"),
             ],
-            smiles_dsl="[x:Agent:X] -[causes:+]-> [y:Resource:Y]",
+            smiles_dsl="[x:Agent:X] -[CAUSES:causes:+]-> [y:Resource:Y]",
         ),
     }
     defaults.update(overrides)
@@ -374,11 +375,15 @@ class TestCausalEdgeIsCore:
         assert edge.is_core is False
 
     def test_is_core_serialization(self):
-        """is_core が model_dump に含まれる。"""
-        edge = CausalEdge(source="A", target="B", relation="inhibits", polarity="-", is_core=False)
+        """is_core, core_predicate, domain_verb が model_dump に含まれる。"""
+        edge = CausalEdge(source="A", target="B", core_predicate=CorePredicate.INHIBITS, domain_verb="inhibits", polarity="-", is_core=False)
         d = edge.model_dump()
         assert "is_core" in d
         assert d["is_core"] is False
+        assert "core_predicate" in d
+        assert d["core_predicate"] == CorePredicate.INHIBITS
+        assert "domain_verb" in d
+        assert d["domain_verb"] == "inhibits"
 
     def test_structure_with_mixed_core_edges(self):
         """core と peripheral の混合エッジを含む PaperStructure を構築できる。"""
@@ -386,10 +391,10 @@ class TestCausalEdgeIsCore:
             abstract_structure=AbstractStructure(
                 variables=["X", "Y", "Z"],
                 edges=[
-                    CausalEdge(source="X", target="Y", relation="causes", polarity="+", is_core=True),
-                    CausalEdge(source="Y", target="Z", relation="correlates", polarity="+", is_core=False),
+                    CausalEdge(source="X", target="Y", core_predicate=CorePredicate.CAUSES, domain_verb="causes", polarity="+", is_core=True),
+                    CausalEdge(source="Y", target="Z", core_predicate=CorePredicate.CORRELATES, domain_verb="correlates", polarity="+", is_core=False),
                 ],
-                smiles_dsl="[x:Agent:X] ==[causes:+]=> [y:Resource:Y] [y] -[correlates:+]-> [z:Event:Z]",
+                smiles_dsl="[x:Agent:X] ==[CAUSES:causes:+]=> [y:Resource:Y] [y] -[CORRELATES:correlates:+]-> [z:Event:Z]",
             )
         )
         core_edges = [e for e in structure.abstract_structure.edges if e.is_core]
@@ -407,14 +412,14 @@ class TestCausalEdgeIsCore:
             abstract_structure=AbstractStructure(
                 variables=["X", "Y"],
                 edges=[CausalEdge(source="X", target="Y", is_core=True)],
-                smiles_dsl="[x:Agent:X] ==[causes:+]=> [y:Resource:Y]",
+                smiles_dsl="[x:Agent:X] ==[CAUSES:causes:+]=> [y:Resource:Y]",
             )
         )
         proposed = _make_structure(
             abstract_structure=AbstractStructure(
                 variables=["X", "Y"],
                 edges=[CausalEdge(source="X", target="Y", is_core=False)],
-                smiles_dsl="[x:Agent:X] -[causes:+]-> [y:Resource:Y]",
+                smiles_dsl="[x:Agent:X] -[CAUSES:causes:+]-> [y:Resource:Y]",
             )
         )
         diffs = compute_structure_diff(base, proposed)
