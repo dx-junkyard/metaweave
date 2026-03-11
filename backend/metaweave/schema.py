@@ -96,7 +96,7 @@ class AbstractStructure(BaseModel):
 
     variables: list[str] = Field(default_factory=list, description="Extracted variables / key concepts")
     edges: list[CausalEdge] = Field(default_factory=list, description="Causal or relational edges")
-    smiles_dsl: str = Field(default="", description="MetaWeave-SMILES format (e.g., [a:Agent:Organization] ==[CAUSES:operationalizes:+]=> [r:Resource:Profit])")
+    smiles_dsl: str = Field(default="", description="MetaWeave-SMILES format (e.g., (a:Agent:Organization) ==[CAUSES:operationalizes:+]=> (r:Resource:Profit))")
 
 
 class PaperStructure(BaseModel):

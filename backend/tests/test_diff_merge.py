@@ -61,7 +61,7 @@ def _make_structure(**overrides) -> PaperStructure:
             edges=[
                 CausalEdge(source="X", target="Y", core_predicate=CorePredicate.CAUSES, domain_verb="causes", polarity="+"),
             ],
-            smiles_dsl="[x:Agent:X] -[CAUSES:causes:+]-> [y:Resource:Y]",
+            smiles_dsl="(x:Agent:X) -[CAUSES:causes:+]-> (y:Resource:Y)",
         ),
     }
     defaults.update(overrides)
@@ -156,7 +156,7 @@ class TestComputeStructureDiff:
         """smiles_dsl が変更されていなければ diff に含まれない。"""
         from metaweave.extractor import compute_structure_diff
 
-        dsl = "[a:Agent:X] -[causes:+]-> [r:Resource:Y]"
+        dsl = "(a:Agent:X) -[causes:+]-> (r:Resource:Y)"
         base = _make_structure(
             abstract_structure=AbstractStructure(
                 variables=["X", "Y"],
@@ -323,7 +323,7 @@ class TestEvaluateAndMergeDiffBased:
         mock_resp.choices = [MagicMock(message=MagicMock(content=llm_response))]
         mock_client.return_value.chat.completions.create.return_value = mock_resp
 
-        original_dsl = "[x:Agent:X] -[causes:+]-> [y:Resource:Y]"
+        original_dsl = "(x:Agent:X) -[causes:+]-> (y:Resource:Y)"
         base = _make_structure()
         proposed = _make_structure(title="New Title")
         result = evaluate_and_merge_proposals(base, proposed)
@@ -394,7 +394,7 @@ class TestCausalEdgeIsCore:
                     CausalEdge(source="X", target="Y", core_predicate=CorePredicate.CAUSES, domain_verb="causes", polarity="+", is_core=True),
                     CausalEdge(source="Y", target="Z", core_predicate=CorePredicate.CORRELATES, domain_verb="correlates", polarity="+", is_core=False),
                 ],
-                smiles_dsl="[x:Agent:X] ==[CAUSES:causes:+]=> [y:Resource:Y] [y] -[CORRELATES:correlates:+]-> [z:Event:Z]",
+                smiles_dsl="(x:Agent:X) ==[CAUSES:causes:+]=> (y:Resource:Y) (y) -[CORRELATES:correlates:+]-> (z:Event:Z)",
             )
         )
         core_edges = [e for e in structure.abstract_structure.edges if e.is_core]
@@ -412,14 +412,14 @@ class TestCausalEdgeIsCore:
             abstract_structure=AbstractStructure(
                 variables=["X", "Y"],
                 edges=[CausalEdge(source="X", target="Y", is_core=True)],
-                smiles_dsl="[x:Agent:X] ==[CAUSES:causes:+]=> [y:Resource:Y]",
+                smiles_dsl="(x:Agent:X) ==[CAUSES:causes:+]=> (y:Resource:Y)",
             )
         )
         proposed = _make_structure(
             abstract_structure=AbstractStructure(
                 variables=["X", "Y"],
                 edges=[CausalEdge(source="X", target="Y", is_core=False)],
-                smiles_dsl="[x:Agent:X] -[CAUSES:causes:+]-> [y:Resource:Y]",
+                smiles_dsl="(x:Agent:X) -[CAUSES:causes:+]-> (y:Resource:Y)",
             )
         )
         diffs = compute_structure_diff(base, proposed)
