@@ -356,24 +356,36 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
         "These represent the fundamental causal chain without which the paper's thesis collapses.\n"
         "- PERIPHERAL (is_core=false): Supplementary, contextual, or domain-specific relationships "
         "that provide supporting detail but are not essential to the core mechanism.\n\n"
-        "DSL syntax (IMPORTANT — different connectors for core vs. peripheral):\n"
-        "  Core edge:       [varID:OntologyType:value] ==[relationType:polarity]=> [targetVarID:OntologyType:value]\n"
-        "  Peripheral edge: [varID:OntologyType:value] -[relationType:polarity]-> [targetVarID:OntologyType:value]\n\n"
+        "=== CorePredicate (標準述語) — MANDATORY ===\n"
+        "Each CausalEdge MUST set core_predicate to ONE of the following seven standardized values:\n"
+        "  CAUSES     → one variable directly produces or triggers another\n"
+        "  INHIBITS   → one variable suppresses, blocks, or reduces another\n"
+        "  CORRELATES → two variables co-vary without clear directionality\n"
+        "  DEFINES    → one variable characterizes, specifies, or constitutes another\n"
+        "  MEASURES   → one variable operationalizes or quantifies another\n"
+        "  TRANSFORMS → one variable converts or changes the state of another\n"
+        "  REQUIRES   → one variable depends on or presupposes another\n\n"
+        "Each CausalEdge MUST also set domain_verb to the original domain-specific verb "
+        "(e.g., 'operationalizes', 'structures', 'quantifies', 'induces').\n\n"
+        "DSL syntax (IMPORTANT — nodes use parentheses, edges use square brackets):\n"
+        "  Core edge:       (varID:OntologyType:value) ==[CorePredicate:domain_verb:polarity]=> (targetVarID:OntologyType:value)\n"
+        "  Peripheral edge: (varID:OntologyType:value) -[CorePredicate:domain_verb:polarity]-> (targetVarID:OntologyType:value)\n\n"
         "Examples:\n"
-        "  Core:       [a:Agent:Toyota] ==[causes:+]=> [r:Resource:Profit]\n"
-        "  Peripheral: [e:Event:MarketShift] -[correlates:+]-> [r:Resource:Profit]\n\n"
+        "  Core:       (a:Agent:Toyota) ==[CAUSES:operationalizes:+]=> (r:Resource:Profit)\n"
+        "  Core:       (x:Event:Stress) ==[MEASURES:quantifies:+]=> (y:Resource:CortisalLevel)\n"
+        "  Peripheral: (e:Event:MarketShift) -[CORRELATES:correlates:+]-> (r:Resource:Profit)\n\n"
         "=== [PHASE 1 — ONTOLOGY ENFORCEMENT] OntologyType Mandatory Rules ===\n"
         "CRITICAL: Every single node in the DSL string MUST include OntologyType. "
         "Nodes without OntologyType are INVALID and must be rejected.\n\n"
         "VALID OntologyType values (UFO-C/REA upper ontology):\n"
         "  Agent | Resource | Event | Purpose-oriented group | Institutional Agent | Intentional Moment\n\n"
         "ENFORCEMENT CHECKLIST — before finalizing smiles_dsl, verify EVERY node satisfies:\n"
-        "  [✓] Format is [varID:OntologyType:ConcreteValue] — all three parts present\n"
+        "  [✓] Format is (varID:OntologyType:ConcreteValue) — all three parts present\n"
         "  [✓] OntologyType is one of the six valid values listed above\n"
-        "  [✓] No bare [varID:ConcreteValue] without OntologyType (this is FORBIDDEN)\n"
-        "  [✓] No bare [varID:OntologyType] without ConcreteValue (this is FORBIDDEN)\n"
-        "  [✓] Back-references [varID] (for cycles) are acceptable only if the variable "
-        "was already declared with full [varID:OntologyType:ConcreteValue] earlier in the same DSL string\n\n"
+        "  [✓] No bare (varID:ConcreteValue) without OntologyType (this is FORBIDDEN)\n"
+        "  [✓] No bare (varID:OntologyType) without ConcreteValue (this is FORBIDDEN)\n"
+        "  [✓] Back-references (varID) (for cycles) are acceptable only if the variable "
+        "was already declared with full (varID:OntologyType:ConcreteValue) earlier in the same DSL string\n\n"
         "Classification guide:\n"
         "  Agent              → human, organization, institution, actor that initiates action\n"
         "  Resource           → material, information, capital, output, artifact\n"
@@ -390,12 +402,15 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
         "4. Each CausalEdge must set is_core=true for core edges and is_core=false for peripheral edges. "
         "Use ==[…]=> in the DSL for core edges and -[…]-> for peripheral edges.\n"
         "5. If there is a cycle (loop) among variables, reuse the variable ID "
-        "without repeating the full declaration (e.g., [a] instead of [a:Agent:Toyota]).\n"
+        "without repeating the full declaration (e.g., (a) instead of (a:Agent:Toyota)).\n"
         "6. Chain multiple edges with spaces: "
-        "[a:Agent:X] ==[causes:+]=> [r:Resource:Y] [r] -[inhibits:-]-> [a]\n"
+        "(a:Agent:X) ==[CAUSES:operationalizes:+]=> (r:Resource:Y) (r) -[INHIBITS:suppresses:-]-> (a)\n"
         "7. Classify all extraction targets strictly according to OntologyType.\n"
         "8. Aim for roughly 30-50%% of edges to be core. If all edges seem equally important, "
         "select only the most fundamental causal chain as core.\n"
+        "9. CRITICAL: Nodes MUST use parentheses (varID:OntologyType:value) and edges MUST use square brackets "
+        "[CorePredicate:domain_verb:polarity]. The old two-part edge format [relationType:polarity] is FORBIDDEN. "
+        "Using square brackets for nodes is FORBIDDEN.\n"
     )
 
     resp = client.beta.chat.completions.parse(
@@ -760,10 +775,10 @@ def extract_abstraction_pattern(structure: PaperStructure) -> AbstractionPattern
     peripheral_edges = [e for e in structure.abstract_structure.edges if not e.is_core]
 
     core_edges_desc = "\n".join(
-        f"  - {e.source} {e.relation}({e.polarity}) {e.target}" for e in core_edges
+        f"  - {e.source} {e.core_predicate.value}:{e.domain_verb}({e.polarity}) {e.target}" for e in core_edges
     ) or "  (none)"
     peripheral_edges_desc = "\n".join(
-        f"  - {e.source} {e.relation}({e.polarity}) {e.target}" for e in peripheral_edges
+        f"  - {e.source} {e.core_predicate.value}:{e.domain_verb}({e.polarity}) {e.target}" for e in peripheral_edges
     ) or "  (none)"
 
     prompt = (

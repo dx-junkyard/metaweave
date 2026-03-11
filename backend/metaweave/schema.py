@@ -20,6 +20,22 @@ class OntologyType(str, Enum):
     INTENTIONAL_MOMENT = "Intentional Moment"
 
 
+class CorePredicate(str, Enum):
+    """分野横断検索を可能にする標準化されたエッジ述語（Core Predicate）。
+
+    ドメイン固有の動詞（domain_verb）の上位に位置する抽象述語であり、
+    異分野間の Structural Isomorphism 検索を Neo4j 上で実現するために使用する。
+    """
+
+    CAUSES = "CAUSES"
+    INHIBITS = "INHIBITS"
+    CORRELATES = "CORRELATES"
+    DEFINES = "DEFINES"
+    MEASURES = "MEASURES"
+    TRANSFORMS = "TRANSFORMS"
+    REQUIRES = "REQUIRES"
+
+
 class ReviewStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
@@ -59,7 +75,14 @@ class CausalEdge(BaseModel):
 
     source: str = Field(description="Source variable")
     target: str = Field(description="Target variable")
-    relation: str = Field(default="causes", description="Type of relation (causes, inhibits, correlates, ...)")
+    core_predicate: CorePredicate = Field(
+        default=CorePredicate.CAUSES,
+        description="Standardized predicate for cross-domain Neo4j search (CAUSES, INHIBITS, CORRELATES, DEFINES, MEASURES, TRANSFORMS, REQUIRES)",
+    )
+    domain_verb: str = Field(
+        default="causes",
+        description="Domain-specific verb describing the relation (e.g., operationalizes, structures, quantifies)",
+    )
     polarity: str = Field(default="+", description="Causal polarity (+/-)")
     ontology_level: str = Field(default="", description="Ontology relation type (e.g., Intentional Moment)")
     is_core: bool = Field(
@@ -73,7 +96,7 @@ class AbstractStructure(BaseModel):
 
     variables: list[str] = Field(default_factory=list, description="Extracted variables / key concepts")
     edges: list[CausalEdge] = Field(default_factory=list, description="Causal or relational edges")
-    smiles_dsl: str = Field(default="", description="MetaWeave-SMILES format (e.g., [a:Agent:Organization] -[cause:+]-> [r:Resource:Profit])")
+    smiles_dsl: str = Field(default="", description="MetaWeave-SMILES format (e.g., (a:Agent:Organization) ==[CAUSES:operationalizes:+]=> (r:Resource:Profit))")
 
 
 class PaperStructure(BaseModel):
