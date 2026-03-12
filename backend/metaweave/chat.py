@@ -25,6 +25,12 @@ You help researchers deeply understand academic papers by answering questions ba
 1. Relevant text chunks retrieved from the paper (via vector search)
 2. The extracted structured analysis of the paper
 
+**CRITICAL INSTRUCTION REGARDING STRUCTURE DATA:**
+The extracted structured analysis is provided in JSON format. It includes a field named "smiles_dsl" under "abstract_structure" (or directly). 
+This field contains the "MetaWeave-SMILES DSL", a specialized format used to represent the causal graph of the paper.
+Format: `[x:Variable_Name:Ontology_Type] -[relation:polarity]-> [y:Variable_Name:Ontology_Type]`
+If the user asks about "SMILES", "SMILES DSL", or "structure graph", you MUST look at this "smiles_dsl" field and the "variables" / "edges" fields to formulate your answer. Do not confuse it with chemical SMILES.
+
 Answer clearly and concisely in the same language as the user's question.
 If the provided context does not contain enough information to answer, say so honestly."""
 
@@ -106,6 +112,9 @@ def generate_chat_response(
 
     # 2. PaperStructure を取得
     structure = _get_paper_structure(arxiv_id, minio_client)
+
+    # 【デバッグ用】取得した構造データをログに出力して確認する
+    logger.info(f"DEBUG: Loaded structure for {arxiv_id}: {json.dumps(structure.get('abstract_structure', {}), ensure_ascii=False)}")
 
     # 3. コンテキストブロックを構築
     context_parts: list[str] = []

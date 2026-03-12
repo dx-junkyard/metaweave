@@ -20,20 +20,26 @@ MetaWeave は、学術論文から問題解決パターンを自動抽出し、�
 ## システム構成
 
 ```
-                ┌─────────────────────────────────────────┐
-                │            Streamlit Frontend            │
-                │  検索 / 抽出 / レビュー / チャット / パターン  │
-                └───────────────────┬─────────────────────┘
+                ┌──────────────────────────────────────────────────┐
+                │                 Streamlit Frontend                │
+                │  検索 / 抽出 / レビュー / チャット / パターン          │
+                │  Cross-Domain Search / Missing Link Suggestion    │
+                └───────────────────┬──────────────────────────────┘
                                     │ HTTP
-                ┌───────────────────▼─────────────────────┐
-                │              FastAPI Backend             │
-                │  harvester │ extractor │ chat │ patterns │
-                └───┬───────────┬──────────┬──────────────┘
-                    │           │          │
-          ┌─────────▼──┐ ┌──────▼───┐ ┌──▼────────┐
-          │   MinIO    │ │  Qdrant  │ │   Neo4j   │
-          │  (PDF/JSON)│ │ (ベクトル) │ │ (グラフDB) │
-          └────────────┘ └──────────┘ └───────────┘
+                ┌───────────────────▼──────────────────────────────┐
+                │                  FastAPI Backend                  │
+                │  harvester │ extractor │ chat │ patterns │ FANNS  │
+                └───┬──────────┬──────────┬───────────┬────────────┘
+                    │          │          │           │
+          ┌─────────▼──┐ ┌─────▼────┐ ┌──▼────────┐  │
+          │   MinIO    │ │  Qdrant  │ │   Neo4j   │  │
+          │  (PDF/JSON)│ │ (ベクトル) │ │ (グラフDB) │  │
+          └────────────┘ └──────────┘ └───────────┘  │
+                                                       │
+                              ┌────────────────────────▼──┐
+                              │         GROBID              │
+                              │  PDF → TEI XML パーサー     │
+                              └────────────────────────────┘
                                     │
                         ┌───────────▼───────────┐
                         │      OpenAI API        │
@@ -45,11 +51,12 @@ MetaWeave は、学術論文から問題解決パターンを自動抽出し、�
 
 | コンポーネント | 役割 |
 |--------------|------|
-| **Streamlit** (port 8501) | Web UI。論文の検索・取得・レビュー・チャット・パターン管理 |
+| **Streamlit** (port 8501) | Web UI。論文の検索・取得・レビュー・チャット・パターン管理・Cross-Domain Search |
 | **FastAPI** (port 8000) | REST API サーバー。全ビジネスロジックを束ねる |
 | **MinIO** (port 9000) | オブジェクトストレージ。PDF 原本と抽出済み JSON を保管 |
-| **Qdrant** (port 6333) | ベクトル DB。論文チャンクとパターンの意味検索に使用 |
+| **Qdrant** (port 6333) | ベクトル DB。論文チャンクとパターンの意味検索・FANNS ハイブリッド検索に使用 |
 | **Neo4j** (port 7474) | グラフ DB。論文・ユーザー・パターン・提案の関係を保持 |
+| **GROBID** (port 8070) | PDF → TEI XML 変換。論理セクション単位の構造事前マッピングに使用 |
 | **OpenAI API** | 仮説生成・構造抽出・パターン抽出・RAG チャットに使用 |
 
 ---
@@ -62,16 +69,30 @@ MetaWeave は、学術論文から問題解決パターンを自動抽出し、�
 - 商用出版社（Elsevier, Springer, Nature, IEEE, Wiley 等）を自動検出し警告
 - PDF を MinIO へダウンロード・保管
 
-### 2. 仮説駆動型 構造抽出
+### 2. 仮説駆動型 構造抽出（GROBID による構造事前マッピング）
 
-論文テキストを逐次チャンク処理しながら、Reasoning モデルが段階的に構造を精緻化します。
+論文の抽出エンジンは、単純なテキスト分割から **GROBID を統合した構造事前マッピング** へと進化しました。
+
+#### GROBID による論理セクション分割
+
+PDF を GROBID API（`/api/processFulltextDocument`）に送信し、TEI XML から **論理セクション（Abstract, Introduction, Methods, Results 等）** を抽出します。これにより：
+
+- **References / Acknowledgments などのノイズを完全除去** — 参考文献リストがチャンクに混入しない
+- **セクション境界を意識した分割** — 機械的な文字数区切りではなく意味的に完結した単位で処理
+- 抽出精度が大幅に向上
+
+#### 逐次処理パイプライン
 
 ```
-チャンク[0] → 仮説生成
-チャンク[1..N] → 確認 / 修正 / 新情報を蓄積しながら逐次更新
-最終チャンク → PaperStructure として確定
-（並行してチャンクを Qdrant へ埋め込み）
+PDF → GROBID → TEI XML → 論理セクション一覧
+                              │
+            セクション[0] (Abstract 等) → 仮説生成
+            セクション[1..N]            → 確認 / 修正 / 新情報を蓄積しながら逐次更新
+            最終セクション               → PaperStructure として確定
+            （並行してチャンクを Qdrant へ埋め込み）
 ```
+
+Reasoning モデルが段階的に構造を精緻化しながら、最終的に `PaperStructure` を確定します。
 
 抽出される構造（`PaperStructure`）:
 
@@ -81,16 +102,34 @@ MetaWeave は、学術論文から問題解決パターンを自動抽出し、�
 | `hypothesis` | 仮説と根拠 |
 | `methodology` | アプローチ・手法 |
 | `constraints` | 前提条件・限界 |
-| `abstract_structure` | 変数と因果グラフ（エッジ付き） |
+| `abstract_structure` | 変数と因果グラフ（エッジ + SMILES DSL） |
 
-### 3. 人間参加型レビュー & LLM マージゲートウェイ
+### 3. 人間参加型レビュー & LLM マージゲートウェイ（Diff ベース最適化）
 
-- Web UI で抽出結果を編集し「変更を提案」できる
-- 提案は Reasoning モデルが自動レビューし、有益な変更を正典にマージ
+ユーザーの構造提案をレビューする際、**Python 側で正典と提案の差分（Diff）を計算し、変更があったフィールドのみを LLM に評価させるアーキテクチャ** を採用しています。
+
+#### Diff ベースレビューの利点
+
+| 従来の方式 | Diff ベース方式 |
+|-----------|----------------|
+| JSON 全体（数千トークン）を LLM に送信 | 変更フィールドのみを送信（トークン大幅削減） |
+| LLM のハルシネーションで未変更フィールドが破損するリスクあり | 未変更フィールドは LLM に一切触れさせないため破損ゼロ |
+| 差分なしでも必ず LLM コールが発生 | 差分がなければ早期リターン（LLM コスト ゼロ） |
+
+#### フロー
+
+```
+1. compute_structure_diff(base, proposed) → FieldDiff リスト
+2. 差分が空 → 即時リターン（LLM 呼び出しなし）
+3. 差分フィールドのみを LLM に送信 → accept / reject を判定
+4. accept されたフィールドのみ base に適用 → MergeResult 生成
+```
+
+- 提案は Reasoning モデルが自動レビューし、有益な変更を正典にマージ（「ジャンクの中の宝石を拾い上げる」方針）
 - マージ根拠と却下理由も記録（`evaluation_reasoning`）
 - 提案履歴を UI から参照可能
 
-### 4. 抽象化パターン抽出 & 同型評価
+### 4. 抽象化パターン抽出 & 同型評価 & Missing Link Suggestion
 
 論文の承認済み構造から「問題解決の型（`AbstractionPattern`）」を生成します。
 
@@ -104,6 +143,16 @@ AbstractionPattern(
 ```
 
 生成後はバックグラウンドで過去論文との **構造同型評価** を自動実行し、一致する論文に `MATCHES_PATTERN` エッジを追加します。
+
+#### Missing Link Suggestion（構造的空白の検知）
+
+パターンが確立されると、システムは「**そのパターンがまだ適用されていないが有効そうな異分野**」を自律的に検知します。
+
+- LLM がパターンの構造変数と既存マッチ論文の分野を分析
+- まだカバーされていない学術分野を特定し、arXiv 検索クエリ（キーワード）を自動生成
+- UI からワンクリックで提案された分野の論文を検索可能
+
+これにより、システム自身が「次に調べるべき分野」を提案し、パターンライブラリの成長を加速します。
 
 ### 5. RAG チャット
 
@@ -130,21 +179,14 @@ Validation View では論文ごとにバッジで状態を表示します：
 | `📝 draft` | ユーザーが編集中のドラフトが存在する |
 | `🏛️ canonical` | MinIO の正典データを表示中 |
 
-**新規 API エンドポイント：**
-
-| メソッド | パス | 説明 |
-|---------|------|------|
-| `GET` | `/api/draft/{arxiv_id}` | ユーザーのドラフト取得（要認証） |
-| `PUT` | `/api/draft/{arxiv_id}` | ドラフト保存（要認証）|
-| `POST` | `/api/patterns/register` | パターンの正式登録（要認証） |
-
 ### 7. MetaWeave-SMILES DSL & FANNS 検索基盤
 
 因果グラフを化学式 SMILES に倣ったテキスト DSL で表現する独自フォーマットを導入しました。
 
 ```
-[a:Agent:Organization] -[cause:+]-> [r:Resource:Profit]
-[r:Resource:Profit] -[inhibit:-]-> [e:Event:Collapse]
+[a:Agent:Organization] ==[cause:+]==> [r:Resource:Profit]
+[r:Resource:Profit] ==[inhibit:-]==> [e:Event:Collapse]
+[m:Resource:MarketIndex] -[measure:+]-> [r:Resource:Profit]
 ```
 
 #### DSL 設計要素
@@ -152,7 +194,91 @@ Validation View では論文ごとにバッジで状態を表示します：
 | 要素 | 説明 |
 |------|------|
 | `[変数名:OntologyType:具体例]` | ノード表現。OntologyType は UFO-C / REA に準拠 |
-| `-[関係:極性]->` | 有向エッジ。極性は `+`（正）/ `-`（負）|
+| `==[関係:極性]==>` | **コア因果辺**。論文の主眼・骨格となる必須のメカニズム |
+| `-[関係:極性]->` | **周辺因果辺**。測定指標や副次的な影響、前提条件 |
+
+#### コア因果辺と周辺因果辺の分離 — 「保存はリッチに、検索はソリッドに」
+
+論文から抽出した因果グラフをそのまま検索に使うと、**測定指標や副次的な文脈がノイズとなり、真の構造的同型性が埋もれてしまう** という課題がありました。例えば「GDP が上昇した」という測定結果と「資源枯渇が組織を崩壊させる」という本質的メカニズムが同列に扱われ、異分野マッチングの精度を損なっていたのです。
+
+この問題を解決するため、MetaWeave-SMILES DSL のエッジを **コア（Core）** と **周辺（Peripheral）** の2層に分離しました。
+
+```
+論文の因果グラフ
+├── コア因果辺 (==[relation:polarity]==>)
+│   └── 論文の中心的主張を構成する不可欠なメカニズム
+│   └── 例: 過剰消費 ==[deplete:−]==> 共有資源
+│
+└── 周辺因果辺 (-[relation:polarity]->)
+    └── 測定指標、副次的影響、前提条件、文脈情報
+    └── 例: GDP指標 -[measure:+]-> 経済成長
+```
+
+**この分離がシステム全体にもたらすインパクト：**
+
+| 用途 | 使用するエッジ | 設計意図 |
+|------|--------------|---------|
+| **保存（MinIO）** | コア + 周辺の両方 | 論文の完全な因果構造を保持し、情報の解像度を維持 |
+| **RAG チャット** | コア + 周辺の両方 | ユーザーの質問に対し、副次的な文脈も含めた正確な回答を生成 |
+| **Validation View** | コア + 周辺の両方 | 人間がエッジの分類を検証・修正できるインターフェース |
+| **FANNS 異分野検索** | **コアのみ** | ノイズを排除し、骨格レベルの構造マッチングを実現 |
+| **抽象化パターン生成** | **コアのみ** | 本質的なメカニズムだけを変数化し、転写可能なパターンへ昇華 |
+
+この「保存はリッチに、検索はソリッドに」という原則により、情報の網羅性と検索の鋭さを両立させています。
+
+#### 4段階の抽象化パイプライン — ドメイン語彙への過学習を断つ
+
+異分野への構造転写を実現するうえで、最大の敵は **ドメイン語彙への過学習** です。「細胞」「利益」「トヨタ」といった具体名が残存したまま検索やパターン化を行うと、同じ分野の論文ばかりがヒットし、MetaWeave が目指す「セレンディピティの自動生成」は達成できません。
+
+この問題に対し、システムの各レイヤーに **4段階の脱ドメインフィルタ** を組み込みました。論文の具体的な記述から人類共通の問題構造へと、段階的に抽象度を引き上げていきます。
+
+```
+    論文テキスト（ドメイン語彙に満ちた生データ）
+         │
+         ▼
+  ┌──────────────────────────────────────────┐
+  │  Phase 1: Ontology Enforcement（型の強制）  │
+  │  すべての変数に UFO-C/REA 上位オントロジー    │
+  │  (Agent, Resource, Event 等) を付与          │
+  │  → ドメイン非依存の「型の足場」を構築         │
+  └──────────────────┬───────────────────────┘
+                     ▼
+  ┌──────────────────────────────────────────┐
+  │  Phase 2: Variable Substitution（変数化）   │
+  │  具体的な事象を数学的変数 (X, Y, Z) に置換   │
+  │  → ドメイン語彙の残存をフェイルセーフで検出    │
+  └──────────────────┬───────────────────────┘
+                     ▼
+  ┌──────────────────────────────────────────┐
+  │  Phase 3: Regex Wildcarding（検索の汎化）   │
+  │  自然言語 → DSL 変換時にエンティティ名を      │
+  │  ワイルドカード (.*) でマスク                 │
+  │  → 型は指定しつつ具体名は問わない柔軟な検索   │
+  └──────────────────┬───────────────────────┘
+                     ▼
+  ┌──────────────────────────────────────────┐
+  │  Phase 4: Isomorphism Evaluation          │
+  │  （クロスドメイン同型性評価）                  │
+  │  LLM が表面的な語彙一致ではなく              │
+  │  機能・役割の「構造的同型性」を評価            │
+  │  → 評価閾値 0.5 で質を担保                  │
+  └──────────────────────────────────────────┘
+         │
+         ▼
+    ドメイン非依存の問題構造パターン（人類の共有知）
+```
+
+**各フェーズの詳細：**
+
+**Phase 1: Ontology Enforcement（型の強制）** — 抽出時に発動。論文から因果変数を抽出する際、すべてのノードに UFO-C/REA 上位オントロジー（`Agent`, `Resource`, `Event`, `Purpose-oriented group`, `Institutional Agent`, `Intentional Moment`）の付与を義務化します。これにより「トヨタ」は `Agent`、「在庫」は `Resource`、「リーマンショック」は `Event` として型付けされ、ドメインに依存しない共通語彙の足場が形成されます。
+
+**Phase 2: Variable Substitution（変数化フェイルセーフ）** — パターン生成時に発動。コア因果辺の具体的な事象を数学的な変数（X, Y, Z）に置き換えます。さらに、フェイルセーフとしてドメイン固有語彙の残存チェックを実施し、抽象化が不完全なパターンを検出・排除します。
+
+**Phase 3: Regex Wildcarding（検索の汎化）** — Cross-Domain Search 時に発動。自然言語クエリを MetaWeave-SMILES DSL 正規表現に変換する際、エンティティ名を意図的にワイルドカード（`.*`）でマスクします。例えば `[x:Agent:Toyota]` は `[.*:Agent:.*]` となり、「型は Agent だが具体名は何でもよい」という柔軟な構造検索を可能にします。
+
+**Phase 4: Isomorphism Evaluation（クロスドメイン同型性評価）** — パターン登録時のバッチ処理で発動。新規パターンと過去論文のマッチング評価において、Reasoning モデルが表面的な語彙の一致ではなく、変数間の **機能的役割** と **因果構造の同型性** を評価します。評価閾値を 0.5 に設定し、偶然の語彙一致によるフォールスポジティブを抑制しつつ、真に構造的に等価な異分野の論文を発見します。
+
+この4段階のパイプラインにより、MetaWeave は「経済学の論文に書かれた資源配分の構造」と「生態学の論文に書かれた栄養循環の構造」が **同じ問題の型** であることを自動的に認識できるようになります。これこそが、人類の問題構造マップを構築するための核心的ブレイクスルーです。
 
 **OntologyType（`OntologyType` enum）：**
 
@@ -165,9 +291,27 @@ Validation View では論文ごとにバッジで状態を表示します：
 | `Institutional Agent` | 制度的主体 |
 | `Intentional Moment` | 意図・動機 |
 
-`CausalEdge` モデルに `polarity` / `ontology_level` フィールドが追加され、`AbstractStructure` に `smiles_dsl` フィールドが追加されました。
+#### FANNS（Filtered Approximate Nearest Neighbor Search）— 実装完了
 
-**FANNS（Filtered Approximate Nearest Neighbor Search）** のプレースホルダーも `embedder.py` に整備済みで、`smiles_dsl` や変数情報を Qdrant ペイロードに付加し、将来的な構造フィルタ検索を可能にします。
+FANNS ハイブリッド検索が稼働しています。Qdrant の **Pre-filtering（SMILES DSL の正規表現マッチ）** とベクトル検索を組み合わせ、構造的類似性と意味的類似性の両面から異分野論文を横断検索します。
+
+```
+入力: DSL 正規表現パターン + 自然言語クエリ
+  ↓
+1. Qdrant Pre-filter: smiles_dsl フィールドに正規表現マッチ（構造フィルタ）
+2. Vector Search:     クエリ埋め込みで意味的類似論文を上位 K 件取得
+  ↓
+出力: 構造的にも意味的にも類似した論文リスト
+```
+
+#### Cross-Domain Search UI
+
+Streamlit に **「Cross-Domain Search」** 画面が追加されました。
+
+- ユーザーが自然言語でパターン構造を記述
+- LLM が自動的に MetaWeave-SMILES DSL へ変換（`POST /api/search/nl-to-dsl`）
+- 変換された DSL で FANNS ハイブリッド検索を実行
+- 異分野の類似論文を横断的に発見可能
 
 ### 8. Re-Extract 時の重複 Embedding スキップ
 
@@ -214,21 +358,24 @@ metaweave/
 │   │   └── foundation_seeds.json   # 基盤パターンのシードデータ
 │   │
 │   ├── metaweave/              # コアライブラリ
-│   │   ├── schema.py           # Pydantic モデル（正典スキーマ）+ OntologyType / SMILES DSL
-│   │   ├── extractor.py        # 仮説駆動型論文構造抽出・SMILES DSL 生成
-│   │   ├── harvester.py        # arXiv 検索・PDF 取得
-│   │   ├── embedder.py         # Qdrant ベクトル登録・検索・FANNS プレースホルダー
+│   │   ├── schema.py           # Pydantic モデル（正典スキーマ）+ FieldDiff / SMILES DSL
+│   │   ├── extractor.py        # GROBID 統合・仮説駆動型抽出・Diff ベースマージ
+│   │   ├── harvester.py        # arXiv 検索・PDF 取得・商用出版社フィルタ
+│   │   ├── embedder.py         # Qdrant ベクトル登録・FANNS ハイブリッド検索
 │   │   ├── db.py               # Neo4j ドライバ
-│   │   ├── llm.py              # OpenAI クライアント
+│   │   ├── llm.py              # OpenAI クライアント・Missing Link Suggestion
 │   │   ├── storage.py          # MinIO ラッパー
 │   │   ├── chat.py             # RAG チャットロジック
 │   │   └── batch.py            # パターン同型評価バッチ
+│   │
+│   ├── tests/
+│   │   └── test_diff_merge.py  # Diff 計算・マージロジックのユニットテスト
 │   │
 │   └── scripts/
 │       └── seed_patterns.py    # Foundation Pattern シード注入スクリプト
 │
 └── frontend/
-    ├── app.py                  # Streamlit UI（ドラフト管理・SMILES DSL・パターンプレビュー対応）
+    ├── app.py                  # Streamlit UI（Cross-Domain Search / Missing Link Suggestion 対応）
     ├── Dockerfile
     └── requirements.txt
 ```
@@ -243,16 +390,27 @@ metaweave/
 |--------|------|
 | `PaperStructure` | 論文から抽出した構造（正典） |
 | `AbstractStructure` | 変数・エッジ・SMILES DSL を含む抽象構造 |
-| `CausalEdge` | 因果エッジ（`polarity`, `ontology_level` を含む） |
+| `CausalEdge` | 因果エッジ（`polarity`, `ontology_level`, `is_core` を含む。コア/周辺の分離を管理） |
 | `OntologyType` | UFO-C / REA に基づく上位オントロジー型 enum |
+| `FieldDiff` | Diff ベースレビューの単一フィールド差分（field_path / base_value / proposed_value） |
 | `AbstractionPattern` | 抽象化された問題解決パターン |
 | `PatternMatch` | パターンと論文の対応関係 |
 | `StructureProposal` | ユーザーによる構造変更提案 |
 | `MergeResult` | LLM によるマージ評価結果 |
+| `MissingLinkSuggestion` | 構造的空白の検知結果（異分野 + 検索クエリ） |
 
 #### `extractor.py` — 抽出エンジン
 
-仮説検証型チャンク解析の実装。最初のチャンクで仮説を立て、後続チャンクで `_AnalysisState`（confirmed / revised / new_info / pending）を更新する逐次処理。最終的に `beta.chat.completions.parse` で `PaperStructure` を確定する。
+GROBID 統合による構造事前マッピングと、仮説検証型チャンク解析の実装。最初のセクションで仮説を立て、後続セクションで `_AnalysisState` を更新する逐次処理。最終的に `PaperStructure` を確定する。
+
+Diff ベースマージ関数も実装：
+
+- `compute_structure_diff(base, proposed)` — フィールドレベルの差分計算
+- `evaluate_and_merge_proposals(base, proposed)` — 差分フィールドのみを LLM に送信し選択的マージ
+
+#### `embedder.py` — FANNS 検索エンジン
+
+- `search_fanns_hybrid(dsl_regex, query_text, top_k)` — DSL 正規表現 Pre-filtering + ベクトル検索のハイブリッド検索（実装完了）
 
 #### `batch.py` — 同型評価バッチ
 
@@ -302,6 +460,7 @@ docker compose up -d
 | MinIO コンソール | http://localhost:9001 |
 | Neo4j ブラウザ | http://localhost:7474 |
 | Qdrant ダッシュボード | http://localhost:6333/dashboard |
+| GROBID | http://localhost:8070 |
 
 ### 4. Foundation Pattern シード注入（初回のみ）
 
@@ -325,6 +484,7 @@ docker compose exec backend python -m scripts.seed_patterns
 
 「Harvester」ページで検索ワードを入力し、arXiv から論文を検索します。
 目的の論文の「Fetch & Store」ボタンを押すと PDF をダウンロードし、バックグラウンドで構造抽出が始まります。
+（抽出は GROBID による論理セクション分割を経て、Reasoning モデルが逐次処理します）
 
 **③ 抽出結果のレビュー（ドラフトワークフロー）**
 
@@ -344,7 +504,7 @@ Structure Editor は 4 つのタブで構成されています：
 
 - **💾 Save** → ユーザーの Neo4j ドラフトに保存（正典は変更しない）
 - **🔄 Re-Extract** → `is_draft=True` で再抽出（Qdrant への二重登録をスキップ）
-- **💡 Propose** → 現在のドラフトを LLM Gateway に送信してレビュー → 正典マージ
+- **💡 Propose** → 現在のドラフトを LLM Gateway に送信。Diff ベースで差分フィールドのみレビューし正典にマージ
 - **✅ Approve** → 論文を承認済みに設定
 
 「📋 提案履歴」タブで過去の提案とその評価理由をタイムライン表示できます。
@@ -355,7 +515,22 @@ Structure Editor は 4 つのタブで構成されています：
 内容を確認・編集し「🌍 Register」ボタンを押すと正式に Neo4j + Qdrant へ登録され、バッチ同型評価が走ります。
 「Pattern Library」ページで登録されたパターンを一覧確認できます。
 
-**⑤ RAG チャット**
+**⑤ Missing Link Suggestion（構造的空白の探索）**
+
+「Pattern Library」ページのパターン詳細から「🔍 Find Missing Links」を実行すると、そのパターンがまだ適用されていない有望な異分野が提案されます。
+提案された分野の arXiv 検索クエリをワンクリックで「Harvester」に引き渡して新たな論文を探索できます。
+
+**⑥ Cross-Domain Search（異分野横断検索）**
+
+「Cross-Domain Search」ページで自然言語によるパターン構造の記述を入力します。
+
+1. LLM が自然言語を MetaWeave-SMILES DSL へ自動変換
+2. FANNS ハイブリッド検索（DSL 正規表現 Pre-filtering + ベクトル類似検索）を実行
+3. 構造的にも意味的にも類似した論文を異分野横断で一覧表示
+
+これにより、専門用語を知らなくても「この構造に似た問題を扱っている論文」を異分野から発見できます。
+
+**⑦ RAG チャット**
 
 Validation ページの「💬 Chat」タブで論文に関する質問を自然言語で入力できます。
 
@@ -370,6 +545,14 @@ curl "http://localhost:8000/api/search?query=transformer+attention&max_results=1
 
 # 抽出ジョブのステータス確認
 curl "http://localhost:8000/api/extract-status/2301.00001"
+
+# FANNS ハイブリッド検索
+curl -X POST http://localhost:8000/api/search/structure \
+  -H "Content-Type: application/json" \
+  -d '{"dsl_regex": ".*Agent.*causes.*Resource.*", "query_text": "tragedy of the commons", "top_k": 10}'
+
+# Missing Link Suggestion
+curl "http://localhost:8000/api/patterns/{pattern_id}/suggestions"
 ```
 
 詳細なエンドポイント仕様は http://localhost:8000/docs を参照してください。
@@ -391,7 +574,7 @@ curl "http://localhost:8000/api/extract-status/2301.00001"
 
 | メソッド | パス | 説明 |
 |---------|------|------|
-| `POST` | `/api/extract` | 非同期抽出ジョブ開始 |
+| `POST` | `/api/extract` | 非同期抽出ジョブ開始（GROBID 経由） |
 | `GET` | `/api/extract-status/{arxiv_id}` | ジョブステータス確認 |
 | `GET` | `/api/extract-result/{arxiv_id}` | 抽出済み構造取得 |
 | `PUT` | `/api/extract-result/{arxiv_id}` | 構造の手動更新 |
@@ -400,7 +583,7 @@ curl "http://localhost:8000/api/extract-status/2301.00001"
 
 | メソッド | パス | 説明 |
 |---------|------|------|
-| `POST` | `/api/propose-structure` | 構造変更提案の送信 |
+| `POST` | `/api/propose-structure` | 構造変更提案の送信（Diff ベース LLM レビュー） |
 | `GET` | `/api/proposals/{arxiv_id}` | 提案履歴の取得 |
 
 ### パターン
@@ -411,6 +594,14 @@ curl "http://localhost:8000/api/extract-status/2301.00001"
 | `POST` | `/api/patterns/register` | パターンの正式登録（Neo4j + Qdrant + バッチ評価） |
 | `GET` | `/api/patterns` | 全パターン一覧 |
 | `GET` | `/api/papers/{arxiv_id}/patterns` | 論文にマッチするパターン一覧 |
+| `GET` | `/api/patterns/{pattern_id}/suggestions` | Missing Link Suggestion（構造的空白の異分野 + 検索クエリ） |
+
+### 検索（FANNS）
+
+| メソッド | パス | 説明 |
+|---------|------|------|
+| `POST` | `/api/search/structure` | FANNS ハイブリッド検索（DSL 正規表現 + ベクトル類似） |
+| `POST` | `/api/search/nl-to-dsl` | 自然言語 → MetaWeave-SMILES DSL 変換（Cross-Domain Search 用） |
 
 ### ドラフト管理
 

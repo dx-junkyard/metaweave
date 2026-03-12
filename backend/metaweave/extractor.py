@@ -34,7 +34,7 @@ import requests
 from bs4 import BeautifulSoup, Tag
 
 from metaweave.llm import get_client, get_settings
-from metaweave.schema import AbstractionPattern, MergeResult, PaperStructure
+from metaweave.schema import AbstractionPattern, FieldDiff, MergeResult, PaperStructure
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +325,7 @@ def _refine_with_chunk(state: _AnalysisState, chunk: str, chunk_idx: int) -> Non
     logger.debug("Chunk %d refined for state", chunk_idx)
 
 
-def _finalize_structure(state: _AnalysisState, paper_id: str) -> PaperStructure:
+def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "") -> PaperStructure:
     """蓄積された分析状態から最終的な PaperStructure を生成する。"""
     client = get_client()
     settings = get_settings()
@@ -350,21 +350,68 @@ def _finalize_structure(state: _AnalysisState, paper_id: str) -> PaperStructure:
         "=== MetaWeave-SMILES DSL Instructions ===\n"
         "You MUST encode all extracted causal relationships (CausalEdge) and variables "
         "into the MetaWeave-SMILES DSL and store the result in abstract_structure.smiles_dsl.\n\n"
-        "DSL syntax:\n"
-        "  [variableID:OntologyType:concreteValue] -[relationType:polarity]-> [targetVariableID:OntologyType:concreteValue]\n"
-        "Example:\n"
-        "  [a:Agent:Toyota] -[causes:+]-> [r:Resource:Profit]\n\n"
+        "=== Core vs. Peripheral Edge Classification ===\n"
+        "Each CausalEdge must be classified as either CORE or PERIPHERAL:\n"
+        "- CORE (is_core=true): Backbone mechanisms essential to the paper's main argument. "
+        "These represent the fundamental causal chain without which the paper's thesis collapses.\n"
+        "- PERIPHERAL (is_core=false): Supplementary, contextual, or domain-specific relationships "
+        "that provide supporting detail but are not essential to the core mechanism.\n\n"
+        "=== CorePredicate (標準述語) — MANDATORY ===\n"
+        "Each CausalEdge MUST set core_predicate to ONE of the following seven standardized values:\n"
+        "  CAUSES     → one variable directly produces or triggers another\n"
+        "  INHIBITS   → one variable suppresses, blocks, or reduces another\n"
+        "  CORRELATES → two variables co-vary without clear directionality\n"
+        "  DEFINES    → one variable characterizes, specifies, or constitutes another\n"
+        "  MEASURES   → one variable operationalizes or quantifies another\n"
+        "  TRANSFORMS → one variable converts or changes the state of another\n"
+        "  REQUIRES   → one variable depends on or presupposes another\n\n"
+        "Each CausalEdge MUST also set domain_verb to the original domain-specific verb "
+        "(e.g., 'operationalizes', 'structures', 'quantifies', 'induces').\n\n"
+        "DSL syntax (IMPORTANT — nodes use parentheses, edges use square brackets):\n"
+        "  Core edge:       (varID:OntologyType:value) ==[CorePredicate:domain_verb:polarity]=> (targetVarID:OntologyType:value)\n"
+        "  Peripheral edge: (varID:OntologyType:value) -[CorePredicate:domain_verb:polarity]-> (targetVarID:OntologyType:value)\n\n"
+        "Examples:\n"
+        "  Core:       (a:Agent:Toyota) ==[CAUSES:operationalizes:+]=> (r:Resource:Profit)\n"
+        "  Core:       (x:Event:Stress) ==[MEASURES:quantifies:+]=> (y:Resource:CortisalLevel)\n"
+        "  Peripheral: (e:Event:MarketShift) -[CORRELATES:correlates:+]-> (r:Resource:Profit)\n\n"
+        "=== [PHASE 1 — ONTOLOGY ENFORCEMENT] OntologyType Mandatory Rules ===\n"
+        "CRITICAL: Every single node in the DSL string MUST include OntologyType. "
+        "Nodes without OntologyType are INVALID and must be rejected.\n\n"
+        "VALID OntologyType values (UFO-C/REA upper ontology):\n"
+        "  Agent | Resource | Event | Purpose-oriented group | Institutional Agent | Intentional Moment\n\n"
+        "ENFORCEMENT CHECKLIST — before finalizing smiles_dsl, verify EVERY node satisfies:\n"
+        "  [✓] Format is (varID:OntologyType:ConcreteValue) — all three parts present\n"
+        "  [✓] OntologyType is one of the six valid values listed above\n"
+        "  [✓] CRITICAL: ConcreteValue MUST NOT contain parentheses '(' or ')'. To include acronyms or extra info, use square brackets '[]' or hyphens '-' instead (e.g., Use (f:Resource:5DCR_framework_[Revised]) instead of (f:Resource:5DCR_framework_(Revised))).\n"
+        "  [✓] No bare (varID:ConcreteValue) without OntologyType (this is FORBIDDEN)\n"
+        "  [✓] No bare (varID:OntologyType) without ConcreteValue (this is FORBIDDEN)\n"
+        "  [✓] Back-references (varID) (for cycles) are acceptable only if the variable "
+        "was already declared with full (varID:OntologyType:ConcreteValue) earlier in the same DSL string\n\n"
+        "Classification guide:\n"
+        "  Agent              → human, organization, institution, actor that initiates action\n"
+        "  Resource           → material, information, capital, output, artifact\n"
+        "  Event              → occurrence, process, phenomenon, dynamic change\n"
+        "  Purpose-oriented group → team, community, project group with shared goal\n"
+        "  Institutional Agent → university, government, standard body, legal entity\n"
+        "  Intentional Moment  → intention, goal, belief, commitment, mental state\n\n"
         "Rules:\n"
-        "1. Each variable must be assigned an OntologyType from the following: "
-        "Agent, Resource, Event, Purpose-oriented group, Institutional Agent, Intentional Moment.\n"
+        "1. Each variable must be assigned an OntologyType from the six valid values. "
+        "No exceptions. If uncertain, choose the closest type.\n"
         "2. Each CausalEdge must specify polarity (+ or -) in both the edge's polarity field "
         "and the DSL string.\n"
         "3. Each CausalEdge must specify ontology_level with the relevant ontology relation type.\n"
-        "4. If there is a cycle (loop) among variables, reuse the variable ID "
-        "without repeating the full declaration (e.g., [a] instead of [a:Agent:Toyota]).\n"
-        "5. Chain multiple edges with spaces: "
-        "[a:Agent:X] -[causes:+]-> [r:Resource:Y] [r] -[inhibits:-]-> [a]\n"
-        "6. Classify all extraction targets strictly according to OntologyType.\n"
+        "4. Each CausalEdge must set is_core=true for core edges and is_core=false for peripheral edges. "
+        "Use ==[…]=> in the DSL for core edges and -[…]-> for peripheral edges.\n"
+        "5. If there is a cycle (loop) among variables, reuse the variable ID "
+        "without repeating the full declaration (e.g., (a) instead of (a:Agent:Toyota)).\n"
+        "6. Chain multiple edges with spaces: "
+        "(a:Agent:X) ==[CAUSES:operationalizes:+]=> (r:Resource:Y) (r) -[INHIBITS:suppresses:-]-> (a)\n"
+        "7. Classify all extraction targets strictly according to OntologyType.\n"
+        "8. Aim for roughly 30-50%% of edges to be core. If all edges seem equally important, "
+        "select only the most fundamental causal chain as core.\n"
+        "9. CRITICAL: Nodes MUST use parentheses (varID:OntologyType:value) and edges MUST use square brackets "
+        "[CorePredicate:domain_verb:polarity]. The old two-part edge format [relationType:polarity] is FORBIDDEN. "
+        "Using square brackets for nodes is FORBIDDEN.\n"
     )
 
     resp = client.beta.chat.completions.parse(
@@ -373,7 +420,7 @@ def _finalize_structure(state: _AnalysisState, paper_id: str) -> PaperStructure:
         response_format=PaperStructure,
     )
     structure: PaperStructure = resp.choices[0].message.parsed
-    return structure.model_copy(update={"paper_id": paper_id})
+    return structure.model_copy(update={"paper_id": paper_id, "license": license})
 
 
 def _embed_and_store_chunks(chunks: list[str], paper_id: str) -> None:
@@ -399,6 +446,7 @@ def extract_paper_structure(
     paper_id: str = "",
     skip_embedding: bool = False,
     pdf_bytes: bytes | None = None,
+    license: str = "",
 ) -> PaperStructure:
     """仮説検証型の逐次処理で論文テキストから PaperStructure を抽出する。
 
@@ -465,7 +513,7 @@ def extract_paper_structure(
 
         # Step 3: 最終評価
         logger.info("Finalizing structure for %s", paper_id)
-        structure = _finalize_structure(state, paper_id)
+        structure = _finalize_structure(state, paper_id, license=license)
 
     finally:
         # Embedding の完了を待つ（最大 90 秒、失敗しても続行）
@@ -483,6 +531,71 @@ def extract_paper_structure(
 
 
 # ---------------------------------------------------------------------------
+# Public: Diff 計算 (Gateway層)
+# ---------------------------------------------------------------------------
+
+def _flatten_value(value: Any) -> str:
+    """ネストされた値を比較用の文字列に変換する。"""
+    if isinstance(value, list):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value) if value is not None else ""
+
+
+def compute_structure_diff(
+    base: PaperStructure,
+    proposed: PaperStructure,
+) -> list[FieldDiff]:
+    """base と proposed の PaperStructure を比較し、変更があるフィールドのみを返す。
+
+    比較は ``model_dump()`` で辞書化した上で再帰的に行い、
+    review_status / paper_id など自動管理フィールドは除外する。
+
+    Parameters
+    ----------
+    base:
+        現在の正典 PaperStructure。
+    proposed:
+        ユーザー提案の PaperStructure。
+
+    Returns
+    -------
+    list[FieldDiff]
+        変更のあるフィールドのリスト。変更なしの場合は空リスト。
+    """
+    _SKIP_FIELDS = {"paper_id", "review_status", "reviewer_notes"}
+
+    def _recurse(
+        base_dict: dict[str, Any],
+        proposed_dict: dict[str, Any],
+        prefix: str = "",
+    ) -> list[FieldDiff]:
+        diffs: list[FieldDiff] = []
+        for key in base_dict:
+            if key in _SKIP_FIELDS and not prefix:
+                continue
+            path = f"{prefix}.{key}" if prefix else key
+            b_val = base_dict.get(key)
+            p_val = proposed_dict.get(key)
+
+            if isinstance(b_val, dict) and isinstance(p_val, dict):
+                diffs.extend(_recurse(b_val, p_val, path))
+            else:
+                b_str = _flatten_value(b_val)
+                p_str = _flatten_value(p_val)
+                if b_str != p_str:
+                    diffs.append(FieldDiff(
+                        field_path=path,
+                        base_value=b_str,
+                        proposed_value=p_str,
+                    ))
+        return diffs
+
+    return _recurse(base.model_dump(), proposed.model_dump())
+
+
+# ---------------------------------------------------------------------------
 # Public: LLM提案評価・マージ関数 (Gateway層)
 # ---------------------------------------------------------------------------
 
@@ -491,6 +604,12 @@ def evaluate_and_merge_proposals(
     proposed_structure: PaperStructure,
 ) -> MergeResult:
     """Reasoningモデルを使って正典構造とユーザー提案をマージ・評価する。
+
+    Diff ベースの最適化:
+    1. base と proposed の差分を計算し、変更がなければ早期リターン。
+    2. 変更があるフィールドのみを LLM に送信しトークン消費を削減。
+    3. LLM が承認した変更のみを base 構造に適用し、未変更フィールドの
+       ハルシネーションによる破損を防止する。
 
     方針: 「ジャンクの中の宝石」を最大限に拾い上げる。
     粗削りな提案であっても有用な洞察・補足・修正を積極的に取り込み、
@@ -515,38 +634,118 @@ def evaluate_and_merge_proposals(
     すべてのプロンプトを ``user`` ロールで送信する。
     temperature 等のパラメータも指定しない。
     """
+    # --- Step 1: Diff 計算 ---
+    diffs = compute_structure_diff(base_structure, proposed_structure)
+
+    if not diffs:
+        logger.info("No diff detected — returning base structure as-is")
+        return MergeResult(
+            merged_structure=base_structure.model_copy(),
+            evaluation_reasoning="提案構造と正典構造の間に差分がないため、変更なし。",
+        )
+
+    logger.info("Diff detected: %d field(s) changed", len(diffs))
+
+    # --- Step 2: 差分のみを LLM に送信 ---
     client = get_client()
     settings = get_settings()
 
+    diff_lines: list[str] = []
+    for d in diffs:
+        diff_lines.append(
+            f"- field: {d.field_path}\n"
+            f"  base:     {d.base_value}\n"
+            f"  proposed: {d.proposed_value}"
+        )
+    diff_text = "\n".join(diff_lines)
+
     prompt = (
         "あなたは論文構造レビュアーです。\n"
-        "以下に「現在の正典構造 (base)」と「ユーザー提案構造 (proposed)」を示します。\n\n"
+        "以下に、正典構造 (base) とユーザー提案 (proposed) の「差分のみ」を示します。\n"
+        "差分に含まれないフィールドは変更されていないため、一切触れないでください。\n\n"
         "【マージ方針】\n"
         "提案はジャンクを含む可能性がありますが、その中にある「宝石」（有用な洞察・"
         "補足・修正・新しい視点）を最大限に拾い上げてください。\n"
         "たとえ粗削りな提案であっても、正典構造をより正確・豊かにする部分があれば"
         "積極的に取り込んでください。\n"
-        "一方、誤り・無関係・冗長な部分は正典から除外し、その理由を明記してください。\n\n"
-        f"--- base_structure ---\n{base_structure.model_dump_json(indent=2)}\n\n"
-        f"--- proposed_structure ---\n{proposed_structure.model_dump_json(indent=2)}\n\n"
-        "上記をマージした最終構造 (merged_structure) と、"
-        "マージした理由・却下した部分の理由 (evaluation_reasoning) を出力してください。\n"
-        f"merged_structure の paper_id は \"{base_structure.paper_id}\" を引き継いでください。"
+        "一方、誤り・無関係・冗長な部分は却下し、その理由を明記してください。\n\n"
+        f"--- 差分フィールド ({len(diffs)} 件) ---\n{diff_text}\n\n"
+        "【出力形式】\n"
+        "各差分フィールドについて、以下の JSON 配列で回答してください:\n"
+        '[\n  {"field_path": "...", "action": "accept" or "reject", "final_value": "...", "reason": "..."}\n]\n'
+        "action が accept の場合: final_value に採用する値を入れてください（proposed そのままでも base との折衷でも可）。\n"
+        "action が reject の場合: final_value は空文字で構いません。base の値が維持されます。\n"
+        "JSON 配列のみで回答してください。"
     )
 
-    resp = client.beta.chat.completions.parse(
+    resp = client.chat.completions.create(
         model=settings.analysis_model,
         messages=[{"role": "user", "content": prompt}],
-        response_format=MergeResult,
     )
-    result: MergeResult = resp.choices[0].message.parsed
+    raw = resp.choices[0].message.content or "[]"
+
+    # --- Step 3: LLM 結果をパースして base に差分適用 ---
+    decisions = _parse_diff_decisions(raw)
+    merged_dict = base_structure.model_dump()
+    reasoning_parts: list[str] = []
+
+    for d in diffs:
+        decision = decisions.get(d.field_path)
+        if decision and decision.get("action") == "accept":
+            final_value = decision.get("final_value", d.proposed_value)
+            _set_nested_value(merged_dict, d.field_path, final_value)
+            reason = decision.get("reason", "")
+            reasoning_parts.append(f"[ACCEPT] {d.field_path}: {reason}")
+        else:
+            reason = decision.get("reason", "差分なし or LLM 未回答") if decision else "LLM 未回答"
+            reasoning_parts.append(f"[REJECT] {d.field_path}: {reason}")
+
     # paper_id は正典のものを必ず引き継ぐ
+    merged_dict["paper_id"] = base_structure.paper_id
+    merged_structure = PaperStructure.model_validate(merged_dict)
+
     return MergeResult(
-        merged_structure=result.merged_structure.model_copy(
-            update={"paper_id": base_structure.paper_id}
-        ),
-        evaluation_reasoning=result.evaluation_reasoning,
+        merged_structure=merged_structure,
+        evaluation_reasoning="\n".join(reasoning_parts),
     )
+
+
+def _parse_diff_decisions(raw: str) -> dict[str, dict[str, str]]:
+    """LLM の差分判定レスポンスを field_path → decision dict にパースする。"""
+    match = re.search(r"\[[\s\S]*\]", raw)
+    if not match:
+        return {}
+    try:
+        items = json.loads(match.group())
+    except json.JSONDecodeError:
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for item in items:
+        if isinstance(item, dict) and "field_path" in item:
+            result[item["field_path"]] = item
+    return result
+
+
+def _set_nested_value(d: dict[str, Any], path: str, value: Any) -> None:
+    """ドット区切りパスで辞書のネストされた値を設定する。
+
+    値の型を元の構造に合わせて復元する（list/dict は JSON パース試行）。
+    """
+    keys = path.split(".")
+    for key in keys[:-1]:
+        d = d.setdefault(key, {})
+    last_key = keys[-1]
+    original = d.get(last_key)
+
+    # 元の値が list/dict で、新しい値が str の場合は JSON パースを試行
+    if isinstance(original, (list, dict)) and isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            d[last_key] = parsed
+            return
+        except (json.JSONDecodeError, TypeError):
+            pass
+    d[last_key] = value
 
 
 # ---------------------------------------------------------------------------
@@ -572,15 +771,52 @@ def extract_abstraction_pattern(structure: PaperStructure) -> AbstractionPattern
     client = get_client()
     settings = get_settings()
 
+    # Core edges のみを優先して抽出データを構築
+    core_edges = [e for e in structure.abstract_structure.edges if e.is_core]
+    peripheral_edges = [e for e in structure.abstract_structure.edges if not e.is_core]
+
+    core_edges_desc = "\n".join(
+        f"  - {e.source} {e.core_predicate.value}:{e.domain_verb}({e.polarity}) {e.target}" for e in core_edges
+    ) or "  (none)"
+    peripheral_edges_desc = "\n".join(
+        f"  - {e.source} {e.core_predicate.value}:{e.domain_verb}({e.polarity}) {e.target}" for e in peripheral_edges
+    ) or "  (none)"
+
     prompt = (
         "あなたはメタ構造転写エンジンの一部です。\n"
         "以下の論文構造データから、具体的な事象を「変数（X, Y, Z等）」に置き換え、\n"
         "分野横断で適用可能な汎用的な「問題解決の型（Abstraction Pattern）」を抽出してください。\n\n"
+        "【重要：Core Edge 優先】\n"
+        "論文の因果グラフには Core（骨格メカニズム）と Peripheral（補足要素）の区別があります。\n"
+        "パターン抽出では Core edges を最優先で structural_rules に反映し、\n"
+        "Peripheral edges は補足情報として参考にしつつ、パターンの本質に含めないでください。\n\n"
+        f"--- Core Edges (骨格メカニズム) ---\n{core_edges_desc}\n\n"
+        f"--- Peripheral Edges (補足要素) ---\n{peripheral_edges_desc}\n\n"
         "【ルール】\n"
         "- name: パターンの簡潔な名称（英語、20語以内）\n"
         "- description: パターンの説明（具体的なドメイン用語は使わず、抽象変数で記述）\n"
         "- variables_template: パターン内で使われる抽象変数のリスト（例: [\"X\", \"Y\", \"Z\"]）\n"
-        "- structural_rules: 変数間の関係ルール（例: [\"X inhibits Y\", \"Y enables Z\"]）\n\n"
+        "- structural_rules: 変数間の関係ルール（例: [\"X inhibits Y\", \"Y enables Z\"]）。\n"
+        "  Core edges のみから structural_rules を構成してください。\n\n"
+        "=== [PHASE 2 — VARIABLE SUBSTITUTION FAILSAFE] ===\n"
+        "structural_rules に含まれる表現は完全に抽象化されていなければなりません。\n"
+        "出力前に以下のフェイルセーフチェックを必ず実行してください:\n\n"
+        "【FORBIDDEN（ドメイン語汚染の例 — 出力してはならない）】\n"
+        "  ✗ 'Toyota causes Profit'         → 固有名詞・具体的エンティティが残存\n"
+        "  ✗ 'cells synthesize ATP'          → 生物学ドメイン固有の語彙が残存\n"
+        "  ✗ 'interest rate affects GDP'     → 経済学ドメイン固有の語彙が残存\n"
+        "  ✗ 'X causes Toyota'               → 片方だけ抽象化されており不十分\n\n"
+        "【REQUIRED（完全抽象化の例 — このように出力すること）】\n"
+        "  ✓ 'X causes Y'                    → 両変数が完全に抽象変数\n"
+        "  ✓ 'X inhibits Y when Z increases' → 変数のみで構成\n"
+        "  ✓ 'X enables Y through Z'         → ドメイン語なし\n\n"
+        "【フェイルセーフ手順】\n"
+        "1. structural_rules の各ルール文字列を検査する\n"
+        "2. 固有名詞・専門用語・ドメイン固有語が残存していないか確認する\n"
+        "3. variables_template に含まれない識別子（X, Y, Z 以外の具体的単語）が\n"
+        "   ルール中に存在する場合、そのルールを変数に置き換えるか破棄する\n"
+        "4. description においても同様に、具体的ドメイン用語を使わず\n"
+        "   抽象変数（X, Y, Z 等）で記述されていることを確認する\n\n"
         f"--- 論文構造データ ---\n{structure.model_dump_json(indent=2)}\n\n"
         f'source_arxiv_id は "{structure.paper_id}" を設定してください。\n'
         "JSONスキーマに厳格に従って出力してください。"

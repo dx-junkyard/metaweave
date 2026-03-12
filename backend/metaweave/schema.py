@@ -20,6 +20,22 @@ class OntologyType(str, Enum):
     INTENTIONAL_MOMENT = "Intentional Moment"
 
 
+class CorePredicate(str, Enum):
+    """分野横断検索を可能にする標準化されたエッジ述語（Core Predicate）。
+
+    ドメイン固有の動詞（domain_verb）の上位に位置する抽象述語であり、
+    異分野間の Structural Isomorphism 検索を Neo4j 上で実現するために使用する。
+    """
+
+    CAUSES = "CAUSES"
+    INHIBITS = "INHIBITS"
+    CORRELATES = "CORRELATES"
+    DEFINES = "DEFINES"
+    MEASURES = "MEASURES"
+    TRANSFORMS = "TRANSFORMS"
+    REQUIRES = "REQUIRES"
+
+
 class ReviewStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
@@ -59,9 +75,20 @@ class CausalEdge(BaseModel):
 
     source: str = Field(description="Source variable")
     target: str = Field(description="Target variable")
-    relation: str = Field(default="causes", description="Type of relation (causes, inhibits, correlates, ...)")
+    core_predicate: CorePredicate = Field(
+        default=CorePredicate.CAUSES,
+        description="Standardized predicate for cross-domain Neo4j search (CAUSES, INHIBITS, CORRELATES, DEFINES, MEASURES, TRANSFORMS, REQUIRES)",
+    )
+    domain_verb: str = Field(
+        default="causes",
+        description="Domain-specific verb describing the relation (e.g., operationalizes, structures, quantifies)",
+    )
     polarity: str = Field(default="+", description="Causal polarity (+/-)")
     ontology_level: str = Field(default="", description="Ontology relation type (e.g., Intentional Moment)")
+    is_core: bool = Field(
+        default=True,
+        description="True for backbone/core mechanism edges, False for peripheral/supplementary edges",
+    )
 
 
 class AbstractStructure(BaseModel):
@@ -69,7 +96,7 @@ class AbstractStructure(BaseModel):
 
     variables: list[str] = Field(default_factory=list, description="Extracted variables / key concepts")
     edges: list[CausalEdge] = Field(default_factory=list, description="Causal or relational edges")
-    smiles_dsl: str = Field(default="", description="MetaWeave-SMILES format (e.g., [a:Agent:Organization] -[cause:+]-> [r:Resource:Profit])")
+    smiles_dsl: str = Field(default="", description="MetaWeave-SMILES format (e.g., (a:Agent:Organization) ==[CAUSES:operationalizes:+]=> (r:Resource:Profit))")
 
 
 class PaperStructure(BaseModel):
@@ -82,6 +109,7 @@ class PaperStructure(BaseModel):
     methodology: Methodology = Field(default_factory=Methodology)
     constraints: Constraints = Field(default_factory=Constraints)
     abstract_structure: AbstractStructure = Field(default_factory=AbstractStructure)
+    license: str = Field(default="", description="The license of the paper (e.g., from arXiv metadata)")
     review_status: ReviewStatus = Field(default=ReviewStatus.PENDING)
     reviewer_notes: str = Field(default="")
 
@@ -164,10 +192,44 @@ class PatternMatch(BaseModel):
 # LLM merge result schema (Gateway layer)
 # ---------------------------------------------------------------------------
 
+class FieldDiff(BaseModel):
+    """A single field-level diff between base and proposed structures."""
+
+    field_path: str = Field(description="Dot-separated path to the changed field (e.g. 'hypothesis.statement')")
+    base_value: str = Field(default="", description="Value in the base (canonical) structure")
+    proposed_value: str = Field(default="", description="Value in the proposed structure")
+
+
 class MergeResult(BaseModel):
     """Result of the LLM-driven proposal evaluation and merge."""
 
     merged_structure: PaperStructure = Field(description="The merged canonical structure")
     evaluation_reasoning: str = Field(
         description="Explanation of what was merged, improved, or rejected and why"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Missing Link Suggestion schemas (v2 feature)
+# ---------------------------------------------------------------------------
+
+class FieldSuggestion(BaseModel):
+    """A single field suggestion for a Missing Link search."""
+
+    field: str = Field(description="Recommended academic field or domain")
+    reasoning: str = Field(description="Why this field might exhibit the same structural pattern")
+    keywords: list[str] = Field(
+        default_factory=list,
+        description="Suggested arXiv search keywords combining pattern structure with field terminology",
+    )
+
+
+class MissingLinkSuggestion(BaseModel):
+    """LLM-generated suggestions for structural holes in the Pattern Library."""
+
+    pattern_id: str = Field(description="ID of the source AbstractionPattern")
+    pattern_name: str = Field(default="", description="Name of the pattern for display")
+    suggestions: list[FieldSuggestion] = Field(
+        default_factory=list,
+        description="List of field-specific search suggestions",
     )
