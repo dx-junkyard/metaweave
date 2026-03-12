@@ -25,6 +25,7 @@ from metaweave.schema import (
     Methodology,
     PaperStructure,
     ProblemStatement,
+    ReviewStatus,
 )
 
 # テスト用の Lazy import（extractor は OpenAI client を必要とするが、
@@ -134,7 +135,7 @@ class TestComputeStructureDiff:
 
         base = _make_structure()
         proposed = _make_structure()
-        proposed.review_status = "approved"
+        proposed.review_status = ReviewStatus.APPROVED
         diffs = compute_structure_diff(base, proposed)
         assert len(diffs) == 0
 
@@ -323,7 +324,7 @@ class TestEvaluateAndMergeDiffBased:
         mock_resp.choices = [MagicMock(message=MagicMock(content=llm_response))]
         mock_client.return_value.chat.completions.create.return_value = mock_resp
 
-        original_dsl = "(x:Agent:X) -[causes:+]-> (y:Resource:Y)"
+        original_dsl = "(x:Agent:X) -[CAUSES:causes:+]-> (y:Resource:Y)"
         base = _make_structure()
         proposed = _make_structure(title="New Title")
         result = evaluate_and_merge_proposals(base, proposed)
