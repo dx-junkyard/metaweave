@@ -382,6 +382,7 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
         "ENFORCEMENT CHECKLIST — before finalizing smiles_dsl, verify EVERY node satisfies:\n"
         "  [✓] Format is (varID:OntologyType:ConcreteValue) — all three parts present\n"
         "  [✓] OntologyType is one of the six valid values listed above\n"
+        "  [✓] CRITICAL: ConcreteValue MUST NOT contain parentheses '(' or ')'. To include acronyms or extra info, use square brackets '[]' or hyphens '-' instead (e.g., Use (f:Resource:5DCR_framework_[Revised]) instead of (f:Resource:5DCR_framework_(Revised))).\n"
         "  [✓] No bare (varID:ConcreteValue) without OntologyType (this is FORBIDDEN)\n"
         "  [✓] No bare (varID:OntologyType) without ConcreteValue (this is FORBIDDEN)\n"
         "  [✓] Back-references (varID) (for cycles) are acceptable only if the variable "
