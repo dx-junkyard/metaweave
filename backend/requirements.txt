@@ -14,3 +14,4 @@ neo4j>=5.0,<6
 PyJWT>=2.8,<3
 passlib>=1.7,<2
 bcrypt==3.2.2
+tenacity>=8.2,<10

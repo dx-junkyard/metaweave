@@ -140,10 +140,10 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {st.session_state.token}"}
 
 
-def api_search(query: str, max_results: int) -> list[dict]:
+def api_search(query: str, max_results: int, sort_by: str = "newest") -> list[dict]:
     resp = requests.get(
         f"{BACKEND_URL}/api/search",
-        params={"query": query, "max_results": max_results},
+        params={"query": query, "max_results": max_results, "sort_by": sort_by},
         headers=_auth_headers(),
         timeout=60,
     )
@@ -635,13 +635,21 @@ if page == "Harvester Dashboard":
 
     with st.form("search_form"):
         query = st.text_input("arXiv search query", value="cat:cs.AI")
-        max_results = st.slider("Max results", 5, 50, 10)
+        form_cols = st.columns([2, 1])
+        with form_cols[0]:
+            max_results = st.slider("Max results", 5, 50, 10)
+        with form_cols[1]:
+            sort_by = st.selectbox(
+                "Sort by",
+                options=["newest", "most_cited"],
+                format_func=lambda x: "Newest" if x == "newest" else "Most Cited",
+            )
         submitted = st.form_submit_button("Search")
 
     if submitted and query:
         with st.spinner("Querying arXiv via backend …"):
             try:
-                st.session_state.search_results = api_search(query, max_results)
+                st.session_state.search_results = api_search(query, max_results, sort_by)
             except Exception as exc:
                 st.error(f"Search failed: {exc}")
 
@@ -657,7 +665,11 @@ if page == "Harvester Dashboard":
                 categories = meta.get("categories", [])
 
                 with cols[0]:
-                    st.markdown(f"**{meta['title']}**")
+                    citation_count = meta.get("citation_count", 0)
+                    title_line = f"**{meta['title']}**"
+                    if citation_count > 0:
+                        title_line += f"  \u2003📈 Citations: {citation_count}"
+                    st.markdown(title_line)
                     st.caption(
                         f"Authors: {', '.join(authors[:3])}{'…' if len(authors) > 3 else ''}  \n"
                         f"Categories: {', '.join(categories)}  |  "

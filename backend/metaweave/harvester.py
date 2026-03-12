@@ -42,6 +42,7 @@ class PaperMeta:
     published: str
     license: str = ""
     commercial_flag: bool = False
+    citation_count: int = 0
 
 
 def _extract_id(id_url: str) -> str:

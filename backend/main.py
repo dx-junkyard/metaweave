@@ -46,6 +46,7 @@ from metaweave.batch import run_pattern_evaluation_task
 from metaweave.chat import generate_chat_response
 from metaweave.db import get_driver
 from metaweave.embedder import embed_and_store_pattern, search_fanns_hybrid
+from metaweave.citations import fetch_citation_counts
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
 from metaweave.llm import generate_missing_link_suggestions, get_client, get_settings
 from metaweave.schema import (
@@ -113,6 +114,7 @@ class PaperMetaOut(BaseModel):
     published: str
     license: str
     commercial_flag: bool
+    citation_count: int = 0
 
 
 class FetchRequest(BaseModel):
@@ -125,6 +127,7 @@ class FetchRequest(BaseModel):
     published: str
     license: str = ""
     commercial_flag: bool = False
+    citation_count: int = 0
 
 
 class FetchResponse(BaseModel):
@@ -486,13 +489,26 @@ def healthz() -> dict:
 def search(
     query: str = Query(..., description="arXiv search query (e.g. cat:cs.AI)"),
     max_results: int = Query(default=20, ge=1, le=100),
+    sort_by: str = Query(default="newest", description="Sort order: 'newest' or 'most_cited'"),
 ) -> list[PaperMetaOut]:
-    """Search arXiv and return paper metadata with commercial-publisher flags."""
+    """Search arXiv and return paper metadata with commercial-publisher flags and citation counts."""
     try:
         results = search_arxiv(query, max_results=max_results)
     except Exception as exc:
         logger.exception("arXiv search failed")
         raise HTTPException(status_code=502, detail=f"arXiv search failed: {exc}") from exc
+
+    # Fetch citation counts from Semantic Scholar
+    arxiv_ids = [m.arxiv_id for m in results]
+    citation_map = fetch_citation_counts(arxiv_ids)
+
+    # Merge citation counts into results
+    for m in results:
+        m.citation_count = citation_map.get(m.arxiv_id, 0)
+
+    # Sort by citation count if requested
+    if sort_by == "most_cited":
+        results.sort(key=lambda m: m.citation_count, reverse=True)
 
     return [
         PaperMetaOut(
@@ -505,6 +521,7 @@ def search(
             published=m.published,
             license=m.license,
             commercial_flag=m.commercial_flag,
+            citation_count=m.citation_count,
         )
         for m in results
     ]
