@@ -265,7 +265,7 @@ def api_get_chat_history(arxiv_id: str) -> list[dict]:
     return resp.json().get("history", [])
 
 
-def api_propose_structure(arxiv_id: str, structure: dict) -> dict:
+def api_propose_structure(arxiv_id: str, structure: dict, meta_feedback: str = "") -> dict:
     """POST /api/propose-structure — submit edited structure for LLM gateway review."""
     resp = requests.post(
         f"{BACKEND_URL}/api/propose-structure",
@@ -273,6 +273,7 @@ def api_propose_structure(arxiv_id: str, structure: dict) -> dict:
             "arxiv_id": arxiv_id,
             "user_id": st.session_state.user_id,
             "proposed_structure": structure,
+            "meta_feedback": meta_feedback,
         },
         headers=_auth_headers(),
         timeout=30,
@@ -290,6 +291,21 @@ def api_get_proposals(arxiv_id: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()  # {proposals: [...]}
+
+
+def api_get_meta_proposals(arxiv_id: str | None = None) -> dict:
+    """GET /api/meta-proposals — fetch system meta-proposals from Neo4j."""
+    params = {}
+    if arxiv_id:
+        params["arxiv_id"] = arxiv_id
+    resp = requests.get(
+        f"{BACKEND_URL}/api/meta-proposals",
+        params=params,
+        headers=_auth_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()  # {meta_proposals: [...]}
 
 
 def api_extract_pattern(arxiv_id: str) -> dict:
@@ -851,8 +867,8 @@ elif page == "Validation View":
 
             # ── Structure Editor + Chat ───────────────────────────────────────
             with edit_col:
-                struct_tab, chat_tab, proposals_tab = st.tabs(
-                    ["📄 Extracted Structure", "💬 Chat", "📋 提案履歴"]
+                struct_tab, chat_tab, proposals_tab, meta_tab = st.tabs(
+                    ["📄 Extracted Structure", "💬 Chat", "📋 提案履歴", "💡 メタ提案"]
                 )
 
                 # ── Structure Editor tab ──────────────────────────────────────
@@ -1012,6 +1028,20 @@ elif page == "Validation View":
                                 height=110,
                             )
 
+                        st.divider()
+                        st.markdown("##### 💡 メタフィードバック（任意）")
+                        st.caption(
+                            "現在の表現モデル（SMILES DSL）では表現しきれない"
+                            "構造的な限界を感じた場合、ここに記述してください。"
+                        )
+                        meta_feedback_text = st.text_area(
+                            "表現モデルの限界に関するフィードバック",
+                            value="",
+                            height=100,
+                            key=f"meta_feedback_{active_id}",
+                            placeholder="例: この論文の因果関係には時間的な遅延が含まれており、現在のエッジモデルでは表現できません。",
+                        )
+
                         _btn_col1, _btn_col2 = st.columns(2)
                         with _btn_col1:
                             save_draft_btn = st.form_submit_button(
@@ -1077,13 +1107,15 @@ elif page == "Validation View":
                     if propose:
                         # LLM Gateway へ提案を送信
                         try:
-                            result = api_propose_structure(active_id, updated)
+                            result = api_propose_structure(
+                                active_id, updated, meta_feedback=meta_feedback_text
+                            )
                             proposal_id = result.get("proposal_id", "")
                             st.session_state.pending_proposals[active_id] = proposal_id
-                            st.toast(
-                                "提案を送信しました。AIがレビュー・マージを行います",
-                                icon="💡",
-                            )
+                            _toast_msg = "提案を送信しました。AIがレビュー・マージを行います"
+                            if meta_feedback_text.strip():
+                                _toast_msg += "（メタフィードバックも分析されます）"
+                            st.toast(_toast_msg, icon="💡")
                         except Exception as exc:
                             st.error(f"提案の送信に失敗しました: {exc}")
 
@@ -1301,6 +1333,66 @@ elif page == "Validation View":
                                     st.caption("AIによる評価待ちです。")
                                 else:
                                     st.caption("評価理由が記録されていません。")
+
+                                # メタフィードバック表示
+                                _mf = _p.get("meta_feedback")
+                                if _mf and _mf.strip():
+                                    with st.expander("💡 メタフィードバックを見る"):
+                                        st.markdown(_mf)
+
+                # ── Meta Proposals tab ────────────────────────────────────
+                with meta_tab:
+                    st.markdown("### 💡 メタ提案 (表現モデルの限界)")
+                    st.caption(
+                        "ユーザーのメタフィードバックからAIが自動検出した、"
+                        "現在の表現モデル（SMILES DSL）の構造的限界に関する体系的課題です。"
+                    )
+
+                    _CATEGORY_LABELS = {
+                        "missing_edge_type": "🔗 エッジ型の不足",
+                        "missing_ontology_level": "🏷️ オントロジーレベルの不足",
+                        "temporal_limitation": "⏱️ 時間的表現の限界",
+                        "multi_scale_limitation": "📐 マルチスケール表現の限界",
+                        "bidirectional_limitation": "↔️ 双方向性の限界",
+                        "other": "📝 その他",
+                    }
+
+                    col_refresh_meta, _ = st.columns([1, 4])
+                    with col_refresh_meta:
+                        if st.button("🔄 更新", key=f"refresh_meta_{active_id}"):
+                            st.rerun()
+
+                    try:
+                        meta_data = api_get_meta_proposals(arxiv_id=active_id)
+                        meta_list = meta_data.get("meta_proposals", [])
+                    except Exception as exc:
+                        st.error(f"メタ提案の取得に失敗しました: {exc}")
+                        meta_list = []
+
+                    if not meta_list:
+                        st.info(
+                            "この論文に対するメタ提案はまだありません。\n\n"
+                            "構造提案時に「メタフィードバック」欄に表現モデルの限界を記述すると、"
+                            "AIが自動的に体系的課題を検出・分類します。"
+                        )
+                    else:
+                        for _mp in meta_list:
+                            _mp_cat = _mp.get("category", "other")
+                            _mp_label = _CATEGORY_LABELS.get(_mp_cat, _mp_cat)
+                            _mp_id_short = _mp.get("meta_proposal_id", "")[:8]
+                            _mp_created = _mp.get("created_at", "")
+
+                            with st.container(border=True):
+                                st.markdown(f"**{_mp_label}**  `{_mp_id_short}…`")
+                                if _mp_created:
+                                    st.caption(f"検出日時: {_mp_created}")
+                                st.markdown(f"**課題:** {_mp.get('description', '')}")
+                                _solution = _mp.get("suggested_solution", "")
+                                if _solution:
+                                    st.markdown(f"**提案された解決策:** {_solution}")
+                                _src_pid = _mp.get("source_proposal_id", "")
+                                if _src_pid:
+                                    st.caption(f"元の提案: `{_src_pid[:8]}…`")
 
 # =========================================================================
 # Page C — Pattern Library
