@@ -44,7 +44,7 @@ from pydantic import BaseModel
 from metaweave import extractor as ext
 from metaweave.batch import run_pattern_evaluation_task
 from metaweave.chat import generate_chat_response
-from metaweave.db import get_driver
+from metaweave.db import create_system_meta_proposal, get_driver
 from metaweave.embedder import embed_and_store_pattern, search_fanns_hybrid
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
 from metaweave.llm import generate_missing_link_suggestions, get_client, get_settings
@@ -1052,7 +1052,7 @@ If the feedback is just a data correction or not about expression model limitati
         logger.info("Meta-feedback for proposal %s is not systemic — skipping", proposal.proposal_id)
         return
 
-    # SystemMetaProposal を Neo4j に保存
+    # SystemMetaProposal を Neo4j に保存（db.py のヘルパーを使用）
     meta = SystemMetaProposal(
         category=MetaIssueCategory(result.get("category", "other")),
         description=result.get("description", ""),
@@ -1062,38 +1062,14 @@ If the feedback is just a data correction or not about expression model limitati
     )
     created_at = datetime.datetime.utcnow().isoformat()
     try:
-        driver = get_driver()
-        with driver.session() as session:
-            session.run(
-                """
-                CREATE (m:SystemMetaProposal {
-                    meta_proposal_id:    $meta_proposal_id,
-                    category:            $category,
-                    description:         $description,
-                    suggested_solution:  $suggested_solution,
-                    source_proposal_id:  $source_proposal_id,
-                    arxiv_id:            $arxiv_id,
-                    created_at:          $created_at
-                })
-                WITH m
-                OPTIONAL MATCH (p:StructureProposal {proposal_id: $source_proposal_id})
-                FOREACH (_ IN CASE WHEN p IS NOT NULL THEN [1] ELSE [] END |
-                    CREATE (p)-[:RAISED_META_ISSUE]->(m)
-                )
-                """,
-                meta_proposal_id=meta.meta_proposal_id,
-                category=meta.category.value,
-                description=meta.description,
-                suggested_solution=meta.suggested_solution,
-                source_proposal_id=meta.source_proposal_id,
-                arxiv_id=meta.arxiv_id,
-                created_at=created_at,
-            )
-        logger.info(
-            "Created SystemMetaProposal %s (category=%s) for proposal %s",
-            meta.meta_proposal_id,
-            meta.category.value,
-            proposal.proposal_id,
+        create_system_meta_proposal(
+            meta_issue_id=meta.meta_proposal_id,
+            issue_type=meta.category.value,
+            description=meta.description,
+            suggested_solution=meta.suggested_solution,
+            source_proposal_id=meta.source_proposal_id,
+            arxiv_id=meta.arxiv_id,
+            created_at=created_at,
         )
     except Exception:
         logger.exception(
@@ -1299,7 +1275,7 @@ def get_meta_proposals(
         where_clauses.append("m.arxiv_id = $arxiv_id")
         params["arxiv_id"] = arxiv_id
     if category:
-        where_clauses.append("m.category = $category")
+        where_clauses.append("(m.issue_type = $category OR m.category = $category)")
         params["category"] = category
 
     where_str = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
@@ -1310,8 +1286,8 @@ def get_meta_proposals(
             f"""
             MATCH (m:SystemMetaProposal)
             {where_str}
-            RETURN m.meta_proposal_id    AS meta_proposal_id,
-                   m.category            AS category,
+            RETURN coalesce(m.meta_issue_id, m.meta_proposal_id) AS meta_proposal_id,
+                   coalesce(m.issue_type, m.category)            AS category,
                    m.description         AS description,
                    m.suggested_solution  AS suggested_solution,
                    m.source_proposal_id  AS source_proposal_id,
@@ -1324,8 +1300,8 @@ def get_meta_proposals(
 
     meta_proposals = [
         MetaProposalItem(
-            meta_proposal_id=r["meta_proposal_id"],
-            category=r.get("category", "other"),
+            meta_proposal_id=r["meta_proposal_id"] or "",
+            category=r.get("category") or "other",
             description=r.get("description", ""),
             suggested_solution=r.get("suggested_solution", ""),
             source_proposal_id=r.get("source_proposal_id", ""),

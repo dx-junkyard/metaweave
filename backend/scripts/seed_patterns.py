@@ -73,7 +73,13 @@ def _generate_pattern(seed: dict, client, settings) -> AbstractionPattern:
         "（例: [\"X\", \"Y\", \"Z\"]）。入力の変数を抽象化して定義せよ\n"
         "- structural_rules: 変数間の関係ルール"
         "（例: [\"X inhibits Y\", \"Y enables Z\"]）\n"
-        '- source_arxiv_id: "foundation_seed" を設定\n\n'
+        '- source_arxiv_id: "foundation_seed" を設定\n'
+        "- smarts_regex: 抽出した構造を汎用的に検索・分類するためのSMILES DSL正規表現（SMARTS形式）を生成してください。"
+        "特定のエンティティ名に依存しないよう、適宜 .* のワイルドカードを使用してください。"
+        "例: '\\\\[.*:Agent:.*\\\\] ==\\\\[CAUSES:.*\\\\]=>'\n"
+        "- unresolved_limitations: このパターンを現行のSMILES DSL（ノード・エッジ表現）で"
+        "記述する際に感じた表現の限界があれば、リストとして記述してください。"
+        "限界が特にない場合は空リスト [] としてください。\n\n"
         "JSONスキーマに厳格に従って出力してください。"
     )
 
@@ -108,17 +114,21 @@ def _store_to_neo4j(pattern: AbstractionPattern) -> None:
             """
             MERGE (ap:AbstractionPattern {name: $name})
             ON CREATE SET
-                ap.pattern_id         = $pattern_id,
-                ap.description        = $description,
-                ap.variables_template = $variables_template,
-                ap.structural_rules   = $structural_rules,
-                ap.source_arxiv_id    = $source_arxiv_id
+                ap.pattern_id              = $pattern_id,
+                ap.description             = $description,
+                ap.variables_template      = $variables_template,
+                ap.structural_rules        = $structural_rules,
+                ap.source_arxiv_id         = $source_arxiv_id,
+                ap.smarts_regex            = $smarts_regex,
+                ap.unresolved_limitations  = $unresolved_limitations
             ON MATCH SET
-                ap.pattern_id         = $pattern_id,
-                ap.description        = $description,
-                ap.variables_template = $variables_template,
-                ap.structural_rules   = $structural_rules,
-                ap.source_arxiv_id    = $source_arxiv_id
+                ap.pattern_id              = $pattern_id,
+                ap.description             = $description,
+                ap.variables_template      = $variables_template,
+                ap.structural_rules        = $structural_rules,
+                ap.source_arxiv_id         = $source_arxiv_id,
+                ap.smarts_regex            = $smarts_regex,
+                ap.unresolved_limitations  = $unresolved_limitations
             """,
             pattern_id=pattern.pattern_id,
             name=pattern.name,
@@ -126,6 +136,8 @@ def _store_to_neo4j(pattern: AbstractionPattern) -> None:
             variables_template=pattern.variables_template,
             structural_rules=pattern.structural_rules,
             source_arxiv_id=pattern.source_arxiv_id,
+            smarts_regex=pattern.smarts_regex,
+            unresolved_limitations=pattern.unresolved_limitations,
         )
 
 

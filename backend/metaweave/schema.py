@@ -213,6 +213,14 @@ class AbstractionPattern(BaseModel):
         default="",
         description="arXiv ID of the paper from which this pattern was extracted",
     )
+    smarts_regex: str = Field(
+        default="",
+        description="このパターンを捕捉するためのSMILES DSL正規表現（SMARTS検索用。例: '\\[.*:Agent:.*\\] ==\\[CAUSES:.*\\]=>' ）",
+    )
+    unresolved_limitations: list[str] = Field(
+        default_factory=list,
+        description="このパターン化を試みた際にLLMが感じた現行表現の限界（メタ課題の種）",
+    )
 
 
 class PatternMatch(BaseModel):
