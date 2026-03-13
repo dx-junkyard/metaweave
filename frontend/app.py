@@ -570,7 +570,7 @@ with _user_col:
 with st.sidebar:
     st.markdown("## MetaWeave v1")
     st.caption(f"👤 {st.session_state.username}")
-    page = st.radio("Navigation", ["Harvester Dashboard", "Validation View", "Pattern Library", "Cross-Domain Search"])
+    page = st.radio("Navigation", ["Harvester Dashboard", "Validation View", "Pattern Library", "Cross-Domain Search", "🛠️ Meta Issues"])
 
     if page == "Validation View":
         st.divider()
@@ -946,8 +946,8 @@ elif page == "Validation View":
                             components.html(_vis_html, height=480)
 
                     with st.form(f"structure_form_{active_id}"):
-                        tab_dsl, tab1, tab2, tab3 = st.tabs(
-                            ["🧬 SMILES DSL", "Problem / Hypothesis", "Method / Constraints", "Raw Variables & Edges"]
+                        tab_dsl, tab1, tab2, tab3, tab_meta_input = st.tabs(
+                            ["🧬 SMILES DSL", "Problem / Hypothesis", "Method / Constraints", "Raw Variables & Edges", "💡 Meta Feedback (表現の限界)"]
                         )
 
                         with tab_dsl:
@@ -1028,19 +1028,26 @@ elif page == "Validation View":
                                 height=110,
                             )
 
-                        st.divider()
-                        st.markdown("##### 💡 メタフィードバック（任意）")
-                        st.caption(
-                            "現在の表現モデル（SMILES DSL）では表現しきれない"
-                            "構造的な限界を感じた場合、ここに記述してください。"
-                        )
-                        meta_feedback_text = st.text_area(
-                            "表現モデルの限界に関するフィードバック",
-                            value="",
-                            height=100,
-                            key=f"meta_feedback_{active_id}",
-                            placeholder="例: この論文の因果関係には時間的な遅延が含まれており、現在のエッジモデルでは表現できません。",
-                        )
+                        with tab_meta_input:
+                            st.markdown("#### 💡 表現の限界に関するフィードバック")
+                            st.caption(
+                                "現在のノード・エッジの仕組み（SMILES DSL）では表現しきれない要素があれば、"
+                                "その理由と改善案を自由に記述してください（任意）。\n\n"
+                                "例: 時間的な遅延を伴う因果関係、ハイパーグラフ的な多対多関係、"
+                                "確率的・条件付きの関係性など。"
+                            )
+                            meta_feedback_text = st.text_area(
+                                "メタフィードバック",
+                                value="",
+                                height=180,
+                                key=f"meta_feedback_{active_id}",
+                                placeholder=(
+                                    "例: この論文では「政策Aが経済指標Bに影響を与えるが、"
+                                    "その効果は6ヶ月の遅延を伴う」という関係があります。"
+                                    "現在のエッジモデルでは時間遅延を表現できないため、"
+                                    "CAUSES エッジに delay 属性を追加することを提案します。"
+                                ),
+                            )
 
                         _btn_col1, _btn_col2 = st.columns(2)
                         with _btn_col1:
@@ -1722,3 +1729,120 @@ elif page == "Cross-Domain Search":
                                 f"サイドバーの Navigation で **Validation View** を選択し、"
                                 f"論文 `{_h_arxiv}` の詳細を確認してください。"
                             )
+
+# =========================================================================
+# Page E — Meta Issues (表現の限界ダッシュボード)
+# =========================================================================
+elif page == "🛠️ Meta Issues":
+    st.header("🛠️ Meta Issues — 表現モデルの限界ダッシュボード")
+    st.caption(
+        "MetaWeave コミュニティ全体で検出された、現行 SMILES DSL（ノード・エッジ表現）の"
+        "構造的限界に関する課題を一覧できます。\n\n"
+        "各課題はユーザーのメタフィードバックを AI が自動分析して生成したものです。"
+    )
+
+    _ISSUE_CATEGORY_LABELS = {
+        "missing_edge_type": "🔗 エッジ型の不足",
+        "missing_ontology_level": "🏷️ オントロジーレベルの不足",
+        "temporal_limitation": "⏱️ 時間的表現の限界",
+        "multi_scale_limitation": "📐 マルチスケール表現の限界",
+        "bidirectional_limitation": "↔️ 双方向性の限界",
+        "other": "📝 その他",
+    }
+
+    _ISSUE_CATEGORY_DESC = {
+        "missing_edge_type": "現行の CorePredicate（CAUSES, INHIBITS 等）では表現できない関係性",
+        "missing_ontology_level": "現行の OntologyType（Agent, Resource 等）では分類できないエンティティ",
+        "temporal_limitation": "時間遅延・時系列変化・周期性など時間軸に関する表現の限界",
+        "multi_scale_limitation": "ミクロ・マクロ間のスケール横断的な関係の表現困難",
+        "bidirectional_limitation": "双方向フィードバックループや循環的因果関係の表現困難",
+        "other": "上記カテゴリに該当しないその他の表現上の課題",
+    }
+
+    # フィルター
+    _mi_filter_col, _mi_refresh_col, _ = st.columns([2, 1, 3])
+    with _mi_filter_col:
+        _mi_cat_filter = st.selectbox(
+            "カテゴリでフィルタ",
+            ["すべて"] + list(_ISSUE_CATEGORY_LABELS.values()),
+            key="mi_cat_filter",
+        )
+    with _mi_refresh_col:
+        st.markdown("")  # spacer
+        if st.button("🔄 更新", key="refresh_meta_issues"):
+            st.rerun()
+
+    # カテゴリ名の逆引き: ラベル → key
+    _label_to_key = {v: k for k, v in _ISSUE_CATEGORY_LABELS.items()}
+    _selected_cat = _label_to_key.get(_mi_cat_filter)  # None if "すべて"
+
+    try:
+        _mi_params: dict = {}
+        if _selected_cat:
+            _mi_params["category"] = _selected_cat
+        _mi_resp = requests.get(
+            f"{BACKEND_URL}/api/meta-proposals",
+            params=_mi_params,
+            headers=_auth_headers(),
+            timeout=15,
+        )
+        _mi_resp.raise_for_status()
+        _mi_list = _mi_resp.json().get("meta_proposals", [])
+    except Exception as exc:
+        st.error(f"メタ課題の取得に失敗しました: {exc}")
+        _mi_list = []
+
+    if not _mi_list:
+        st.info(
+            "まだメタ課題が登録されていません。\n\n"
+            "Validation View で論文の構造を確認し、「💡 Meta Feedback (表現の限界)」タブに"
+            "フィードバックを記述して「💡 変更を提案する」ボタンを押すと、"
+            "AI が自動的にメタ課題を検出・登録します。"
+        )
+    else:
+        # サマリー統計
+        _cat_counts: dict[str, int] = {}
+        for _mi in _mi_list:
+            _cat = _mi.get("category", "other")
+            _cat_counts[_cat] = _cat_counts.get(_cat, 0) + 1
+
+        _summary_cols = st.columns(min(len(_cat_counts), 6))
+        for _ci, (_cat_key, _cat_count) in enumerate(_cat_counts.items()):
+            with _summary_cols[_ci % len(_summary_cols)]:
+                _cat_label = _ISSUE_CATEGORY_LABELS.get(_cat_key, _cat_key)
+                st.metric(_cat_label, _cat_count)
+
+        st.divider()
+
+        # 課題カード一覧
+        for _mi in _mi_list:
+            _mi_cat = _mi.get("category", "other")
+            _mi_label = _ISSUE_CATEGORY_LABELS.get(_mi_cat, _mi_cat)
+            _mi_cat_desc = _ISSUE_CATEGORY_DESC.get(_mi_cat, "")
+            _mi_id_short = _mi.get("meta_proposal_id", "")[:8]
+            _mi_desc = _mi.get("description", "")
+            _mi_solution = _mi.get("suggested_solution", "")
+            _mi_arxiv = _mi.get("arxiv_id", "")
+            _mi_src_pid = _mi.get("source_proposal_id", "")
+            _mi_created = _mi.get("created_at", "")
+
+            with st.container(border=True):
+                _mi_head_col, _mi_badge_col = st.columns([4, 1])
+                with _mi_head_col:
+                    st.markdown(f"### {_mi_label}")
+                    if _mi_created:
+                        st.caption(f"検出日時: {_mi_created}  |  ID: `{_mi_id_short}…`")
+                    else:
+                        st.caption(f"ID: `{_mi_id_short}…`")
+                with _mi_badge_col:
+                    if _mi_arxiv:
+                        st.caption(f"論文: `{_mi_arxiv}`")
+
+                st.markdown(f"**課題の詳細:**\n\n{_mi_desc}")
+
+                if _mi_solution:
+                    with st.expander("💡 提案された解決策を見る", expanded=False):
+                        st.markdown(_mi_solution)
+
+                if _mi_src_pid:
+                    st.caption(f"元の構造提案: `{_mi_src_pid[:8]}…`")
