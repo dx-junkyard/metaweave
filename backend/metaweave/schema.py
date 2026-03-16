@@ -36,6 +36,17 @@ class CorePredicate(str, Enum):
     REQUIRES = "REQUIRES"
 
 
+class MetaIssueCategory(str, Enum):
+    """メタ提案の問題分類。表現モデル自体の限界に関するカテゴリ。"""
+
+    MISSING_EDGE_TYPE = "missing_edge_type"
+    MISSING_ONTOLOGY_LEVEL = "missing_ontology_level"
+    TEMPORAL_LIMITATION = "temporal_limitation"
+    MULTI_SCALE_LIMITATION = "multi_scale_limitation"
+    BIDIRECTIONAL_LIMITATION = "bidirectional_limitation"
+    OTHER = "other"
+
+
 class ReviewStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
@@ -134,6 +145,43 @@ class StructureProposal(BaseModel):
     user_id: str = Field(description="ID of the proposing user")
     proposed_structure: PaperStructure = Field(description="The proposed PaperStructure")
     status: ReviewStatus = Field(default=ReviewStatus.PENDING, description="Review status of the proposal")
+    meta_feedback: str = Field(
+        default="",
+        description="User's free-text feedback about expression model limitations",
+    )
+
+
+class SystemMetaProposal(BaseModel):
+    """LLM が自動生成するシステムレベルのメタ提案。
+
+    ユーザーの meta_feedback を分析し、現在の表現モデル（SMILES DSL）の
+    構造的限界に関する体系的な課題を抽出・分類する。
+    """
+
+    meta_proposal_id: str = Field(
+        default_factory=lambda: str(uuid4()),
+        description="Unique identifier for this meta-proposal",
+    )
+    category: MetaIssueCategory = Field(
+        default=MetaIssueCategory.OTHER,
+        description="Classification of the expression model limitation",
+    )
+    description: str = Field(
+        default="",
+        description="Detailed description of the expression limitation",
+    )
+    suggested_solution: str = Field(
+        default="",
+        description="Proposed approach to address the limitation",
+    )
+    source_proposal_id: str = Field(
+        default="",
+        description="ID of the StructureProposal that triggered this meta-proposal",
+    )
+    arxiv_id: str = Field(
+        default="",
+        description="arXiv ID of the paper where the limitation was observed",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +212,14 @@ class AbstractionPattern(BaseModel):
     source_arxiv_id: str = Field(
         default="",
         description="arXiv ID of the paper from which this pattern was extracted",
+    )
+    smarts_regex: str = Field(
+        default="",
+        description="このパターンを捕捉するためのSMILES DSL正規表現（SMARTS検索用。例: '\\[.*:Agent:.*\\] ==\\[CAUSES:.*\\]=>' ）",
+    )
+    unresolved_limitations: list[str] = Field(
+        default_factory=list,
+        description="このパターン化を試みた際にLLMが感じた現行表現の限界（メタ課題の種）",
     )
 
 

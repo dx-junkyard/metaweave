@@ -44,17 +44,19 @@ from pydantic import BaseModel
 from metaweave import extractor as ext
 from metaweave.batch import run_pattern_evaluation_task
 from metaweave.chat import generate_chat_response
-from metaweave.db import get_driver
+from metaweave.db import create_system_meta_proposal, get_driver
 from metaweave.embedder import embed_and_store_pattern, search_fanns_hybrid
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
 from metaweave.llm import generate_missing_link_suggestions, get_client, get_settings
 from metaweave.schema import (
     AbstractionPattern,
     FieldSuggestion,
+    MetaIssueCategory,
     MissingLinkSuggestion,
     PaperStructure,
     PatternMatch,
     StructureProposal,
+    SystemMetaProposal,
 )
 from metaweave.storage import StorageManager
 
@@ -185,6 +187,7 @@ class ProposeStructureRequest(BaseModel):
     arxiv_id: str
     user_id: str
     proposed_structure: PaperStructure
+    meta_feedback: str = ""
 
 
 class ProposeStructureResponse(BaseModel):
@@ -203,6 +206,25 @@ class ProposalItem(BaseModel):
     status: str
     evaluation_reasoning: str | None = None
     created_at: str | None = None
+    meta_feedback: str | None = None
+
+
+class MetaProposalItem(BaseModel):
+    """Single meta-proposal entry for API responses."""
+
+    meta_proposal_id: str
+    category: str
+    description: str
+    suggested_solution: str
+    source_proposal_id: str = ""
+    arxiv_id: str = ""
+    created_at: str | None = None
+
+
+class MetaProposalListResponse(BaseModel):
+    """Response body for GET /api/meta-proposals."""
+
+    meta_proposals: list[MetaProposalItem]
 
 
 class ProposalListResponse(BaseModel):
@@ -959,12 +981,109 @@ def get_chat_history(
 # Background LLM review task
 # ---------------------------------------------------------------------------
 
+def _analyze_meta_feedback(proposal: StructureProposal) -> None:
+    """meta_feedback を LLM で分析し、表現モデルの限界に関する体系的課題を検出する。
+
+    意味のあるメタ提案が検出された場合、SystemMetaProposal ノードを Neo4j に作成し、
+    元の StructureProposal および Paper との関係を設定する。
+    """
+    if not proposal.meta_feedback or not proposal.meta_feedback.strip():
+        return
+
+    try:
+        client = get_client()
+        settings = get_settings()
+    except Exception:
+        logger.warning("LLM client not available — skipping meta-feedback analysis")
+        return
+
+    prompt = f"""You are a systems analyst for the MetaWeave structural knowledge engine.
+
+MetaWeave represents paper structures using a SMILES-like DSL with:
+- Typed nodes (Agent, Resource, Event, etc.)
+- Directed edges with core predicates (CAUSES, INHIBITS, CORRELATES, DEFINES, MEASURES, TRANSFORMS, REQUIRES)
+- Polarity (+/-) and core/peripheral flags
+
+A user has submitted feedback suggesting that this representation model may be insufficient
+for expressing the structure of a particular paper.
+
+## User's Meta-Feedback
+{proposal.meta_feedback}
+
+## Paper arXiv ID
+{proposal.arxiv_id}
+
+## Your Task
+Analyze whether this feedback describes a **systemic limitation** of the expression model
+(not just a data correction). If it does, classify the issue and suggest a solution.
+
+## Output Format (strict JSON)
+If the feedback describes a genuine expression model limitation:
+{{
+  "is_systemic": true,
+  "category": "<one of: missing_edge_type, missing_ontology_level, temporal_limitation, multi_scale_limitation, bidirectional_limitation, other>",
+  "description": "<detailed description of the limitation>",
+  "suggested_solution": "<proposed approach to address it>"
+}}
+
+If the feedback is just a data correction or not about expression model limitations:
+{{
+  "is_systemic": false
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model=settings.analysis_model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.choices[0].message.content or "{}"
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            lines = [ln for ln in lines if not ln.strip().startswith("```")]
+            cleaned = "\n".join(lines)
+
+        result = json.loads(cleaned)
+    except Exception:
+        logger.exception("Meta-feedback LLM analysis failed for proposal %s", proposal.proposal_id)
+        return
+
+    if not result.get("is_systemic"):
+        logger.info("Meta-feedback for proposal %s is not systemic — skipping", proposal.proposal_id)
+        return
+
+    # SystemMetaProposal を Neo4j に保存（db.py のヘルパーを使用）
+    meta = SystemMetaProposal(
+        category=MetaIssueCategory(result.get("category", "other")),
+        description=result.get("description", ""),
+        suggested_solution=result.get("suggested_solution", ""),
+        source_proposal_id=proposal.proposal_id,
+        arxiv_id=proposal.arxiv_id,
+    )
+    created_at = datetime.datetime.utcnow().isoformat()
+    try:
+        create_system_meta_proposal(
+            meta_issue_id=meta.meta_proposal_id,
+            issue_type=meta.category.value,
+            description=meta.description,
+            suggested_solution=meta.suggested_solution,
+            source_proposal_id=meta.source_proposal_id,
+            arxiv_id=meta.arxiv_id,
+            created_at=created_at,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to save SystemMetaProposal for proposal %s", proposal.proposal_id
+        )
+
+
 def _run_review_task(proposal: StructureProposal) -> None:
     """バックグラウンドで実行される LLM 提案レビュータスク。
 
     1. MinIO から正典構造を取得（なければ提案構造を正典として扱う）
     2. evaluate_and_merge_proposals でマージ評価
     3. Neo4j の提案ノードに結果を書き戻す
+    4. meta_feedback があれば LLM で分析し SystemMetaProposal を生成
     """
     driver = get_driver()
 
@@ -1032,6 +1151,9 @@ def _run_review_task(proposal: StructureProposal) -> None:
         new_status,
     )
 
+    # 5. meta_feedback がある場合、LLM で分析して SystemMetaProposal を生成
+    _analyze_meta_feedback(proposal)
+
 
 # ---------------------------------------------------------------------------
 # Proposal endpoint
@@ -1055,6 +1177,7 @@ def propose_structure(
         arxiv_id=body.arxiv_id,
         user_id=body.user_id,
         proposed_structure=body.proposed_structure,
+        meta_feedback=body.meta_feedback,
     )
 
     # Neo4j への保存
@@ -1070,6 +1193,7 @@ def propose_structure(
                     arxiv_id:           $arxiv_id,
                     user_id:            $user_id,
                     proposed_structure: $proposed_structure,
+                    meta_feedback:      $meta_feedback,
                     status:             'pending',
                     created_at:         $created_at
                 })
@@ -1079,6 +1203,7 @@ def propose_structure(
                 proposal_id=proposal_id,
                 arxiv_id=body.arxiv_id,
                 proposed_structure=body.proposed_structure.model_dump_json(),
+                meta_feedback=body.meta_feedback,
                 created_at=created_at,
             )
     except Exception as exc:
@@ -1112,7 +1237,8 @@ def get_proposals(
                    u.username          AS username,
                    p.status            AS status,
                    p.evaluation_reasoning AS evaluation_reasoning,
-                   p.created_at        AS created_at
+                   p.created_at        AS created_at,
+                   p.meta_feedback     AS meta_feedback
             ORDER BY p.created_at DESC
             """,
             arxiv_id=arxiv_id,
@@ -1126,10 +1252,65 @@ def get_proposals(
             status=r["status"] or "pending",
             evaluation_reasoning=r.get("evaluation_reasoning"),
             created_at=r.get("created_at"),
+            meta_feedback=r.get("meta_feedback"),
         )
         for r in records
     ]
     return ProposalListResponse(proposals=proposals)
+
+
+@app.get("/api/meta-proposals", response_model=MetaProposalListResponse)
+def get_meta_proposals(
+    arxiv_id: str | None = Query(default=None, description="Filter by arXiv ID"),
+    category: str | None = Query(default=None, description="Filter by issue category"),
+    current_user: dict = Depends(_get_current_user),
+) -> MetaProposalListResponse:
+    """SystemMetaProposal の一覧を Neo4j から取得する。
+
+    arxiv_id や category でフィルタリング可能。
+    """
+    where_clauses: list[str] = []
+    params: dict = {}
+    if arxiv_id:
+        where_clauses.append("m.arxiv_id = $arxiv_id")
+        params["arxiv_id"] = arxiv_id
+    if category:
+        where_clauses.append("(m.issue_type = $category OR m.category = $category)")
+        params["category"] = category
+
+    where_str = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+    driver = get_driver()
+    with driver.session() as session:
+        records = session.run(
+            f"""
+            MATCH (m:SystemMetaProposal)
+            {where_str}
+            RETURN coalesce(m.meta_issue_id, m.meta_proposal_id) AS meta_proposal_id,
+                   coalesce(m.issue_type, m.category)            AS category,
+                   m.description         AS description,
+                   m.suggested_solution  AS suggested_solution,
+                   m.source_proposal_id  AS source_proposal_id,
+                   m.arxiv_id            AS arxiv_id,
+                   m.created_at          AS created_at
+            ORDER BY m.created_at DESC
+            """,
+            **params,
+        ).data()
+
+    meta_proposals = [
+        MetaProposalItem(
+            meta_proposal_id=r["meta_proposal_id"] or "",
+            category=r.get("category") or "other",
+            description=r.get("description", ""),
+            suggested_solution=r.get("suggested_solution", ""),
+            source_proposal_id=r.get("source_proposal_id", ""),
+            arxiv_id=r.get("arxiv_id", ""),
+            created_at=r.get("created_at"),
+        )
+        for r in records
+    ]
+    return MetaProposalListResponse(meta_proposals=meta_proposals)
 
 
 # ---------------------------------------------------------------------------

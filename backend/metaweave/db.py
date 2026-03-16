@@ -60,3 +60,61 @@ def get_driver() -> Driver:
     driver itself.
     """
     return _Neo4jSingleton().get_driver()
+
+
+def create_system_meta_proposal(
+    *,
+    meta_issue_id: str,
+    issue_type: str,
+    description: str,
+    suggested_solution: str,
+    source_proposal_id: str,
+    arxiv_id: str = "",
+    created_at: str = "",
+) -> None:
+    """SystemMetaProposal を Neo4j に保存し、元の StructureProposal と関連付ける。
+
+    Parameters
+    ----------
+    meta_issue_id : str
+        SystemMetaProposal のユニーク ID。
+    issue_type : str
+        MetaIssueCategory の値（例: "temporal_limitation"）。
+    description : str
+        表現モデルの限界に関する詳細説明。
+    suggested_solution : str
+        提案される解決策。
+    source_proposal_id : str
+        この課題を引き起こした StructureProposal の proposal_id。
+    arxiv_id : str
+        関連する arXiv ID（任意）。
+    created_at : str
+        作成日時の ISO 文字列（任意）。
+    """
+    driver = get_driver()
+    with driver.session() as session:
+        session.run(
+            """
+            MATCH (sp:StructureProposal {proposal_id: $proposal_id})
+            MERGE (mp:SystemMetaProposal {meta_issue_id: $meta_issue_id})
+            SET mp.issue_type          = $issue_type,
+                mp.description         = $description,
+                mp.suggested_solution  = $suggested_solution,
+                mp.arxiv_id            = $arxiv_id,
+                mp.created_at          = $created_at
+            MERGE (sp)-[:RAISED_META_ISSUE]->(mp)
+            """,
+            proposal_id=source_proposal_id,
+            meta_issue_id=meta_issue_id,
+            issue_type=issue_type,
+            description=description,
+            suggested_solution=suggested_solution,
+            arxiv_id=arxiv_id,
+            created_at=created_at,
+        )
+    logger.info(
+        "Created SystemMetaProposal %s (type=%s) linked to proposal %s",
+        meta_issue_id,
+        issue_type,
+        source_proposal_id,
+    )
