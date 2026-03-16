@@ -20,6 +20,8 @@ POST /api/auth/register                 Register a new user (Neo4j User node, re
 POST /api/auth/login                    Authenticate and return a JWT.
 GET  /api/auth/me                       Return the current user's profile (requires Bearer token).
 GET  /api/patterns/{pattern_id}/suggestions  Missing link suggestions for a pattern.
+GET  /api/export/private/{user_id}     Export user's private data (drafts, chat history) as JSON.
+GET  /api/export/public/github         Export sanitized public DSL data for GitHub (Gateway-filtered).
 GET  /healthz                           Health check.
 """
 
@@ -50,11 +52,15 @@ from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
 from metaweave.llm import generate_missing_link_suggestions, get_client, get_settings
 from metaweave.schema import (
     AbstractionPattern,
+    ChatHistoryEntry,
+    DraftEntry,
     FieldSuggestion,
     MetaIssueCategory,
     MissingLinkSuggestion,
     PaperStructure,
     PatternMatch,
+    PrivateBackupExport,
+    PublicDSLExport,
     StructureProposal,
     SystemMetaProposal,
 )
@@ -1734,3 +1740,151 @@ def get_pattern_suggestions(
         suggestions=[SuggestionOut(**s) for s in suggestions],
         cached=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# Export endpoints (3 Zones + Gateway)
+# ---------------------------------------------------------------------------
+
+
+class PrivateExportResponse(BaseModel):
+    """Response wrapper for GET /api/export/private/{user_id}."""
+
+    export: PrivateBackupExport
+
+
+class PublicExportResponse(BaseModel):
+    """Response for GET /api/export/public/github."""
+
+    records: list[PublicDSLExport]
+    dropped_count: int = 0
+
+
+@app.get("/api/export/private/{user_id}", response_model=PrivateExportResponse)
+def export_private(
+    user_id: str,
+    current_user: dict = Depends(_get_current_user),
+) -> PrivateExportResponse:
+    """Private Zone バックアップ: ユーザー個人のドラフトとチャット履歴をフルエクスポートする。"""
+    if user_id != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You can only export your own data")
+
+    driver = get_driver()
+
+    # ── 1. Collect all drafts ────────────────────────────────────────────
+    drafts: list[DraftEntry] = []
+    with driver.session() as session:
+        records = session.run(
+            """
+            MATCH (u:User {id: $uid})-[:HAS_DRAFT]->(d:Draft)
+            RETURN d.arxiv_id AS arxiv_id, d.structure AS structure
+            """,
+            uid=user_id,
+        ).data()
+    for rec in records:
+        aid = rec.get("arxiv_id", "")
+        raw = rec.get("structure", "")
+        if not raw:
+            continue
+        try:
+            ps = PaperStructure.model_validate_json(raw)
+            drafts.append(DraftEntry(arxiv_id=aid, structure=ps))
+        except Exception:
+            logger.warning("Skipping unparseable draft for arxiv_id=%s", aid)
+
+    # ── 2. Collect all chat histories ────────────────────────────────────
+    chat_histories: list[ChatHistoryEntry] = []
+    with driver.session() as session:
+        records = session.run(
+            """
+            MATCH (u:User {id: $uid})-[r:CHATTED_ABOUT]->(p:Paper)
+            RETURN p.arxiv_id AS arxiv_id, r.history AS history
+            """,
+            uid=user_id,
+        ).data()
+    for rec in records:
+        aid = rec.get("arxiv_id", "")
+        raw_hist = rec.get("history", "")
+        if not raw_hist:
+            continue
+        try:
+            messages = json.loads(raw_hist) if isinstance(raw_hist, str) else raw_hist
+        except Exception:
+            messages = []
+        chat_histories.append(ChatHistoryEntry(arxiv_id=aid, messages=messages))
+
+    export = PrivateBackupExport(
+        user_id=user_id,
+        exported_at=datetime.datetime.utcnow().isoformat(),
+        drafts=drafts,
+        chat_histories=chat_histories,
+    )
+    return PrivateExportResponse(export=export)
+
+
+import re as _re
+
+_LICENSE_CONTAMINATION_RE = _re.compile(r"\b(NC|ND|NoDerivatives|NonCommercial)\b", _re.IGNORECASE)
+
+
+@app.get("/api/export/public/github", response_model=PublicExportResponse)
+def export_public_github(
+    current_user: dict = Depends(_get_current_user),
+) -> PublicExportResponse:
+    """Public Zone エクスポート: Gateway を通過した DSL のみを返却する。
+
+    ライセンス汚染（NC / ND）を含むレコードは完全に除外（Drop）する。
+    """
+    sm = StorageManager()
+    bucket = "extracted-structures"
+
+    # ── 1. List all extracted structures from MinIO ───────────────────────
+    try:
+        objects = sm.client.list_objects(bucket, recursive=True)
+        object_names = [obj.object_name for obj in objects]
+    except Exception:
+        logger.warning("Failed to list objects in bucket=%s", bucket)
+        object_names = []
+
+    records: list[PublicDSLExport] = []
+    dropped = 0
+
+    for obj_name in object_names:
+        # ── 2. Load and parse PaperStructure ─────────────────────────────
+        try:
+            resp = sm.client.get_object(bucket, obj_name)
+            raw = resp.read()
+            resp.close()
+            resp.release_conn()
+            ps = PaperStructure.model_validate_json(raw)
+        except Exception:
+            logger.warning("Skipping unparseable object %s", obj_name)
+            continue
+
+        # ── 3. Gateway: drop license-contaminated records ────────────────
+        if _LICENSE_CONTAMINATION_RE.search(ps.license):
+            dropped += 1
+            continue
+
+        # ── 4. Build context_summary from problem/hypothesis (de-expressed) ─
+        summary_parts = []
+        if ps.problem.problem:
+            summary_parts.append(ps.problem.problem)
+        if ps.hypothesis.statement:
+            summary_parts.append(ps.hypothesis.statement)
+        context_summary = " ".join(summary_parts)
+
+        # Derive arXiv URL from paper_id
+        source_url = f"https://arxiv.org/abs/{ps.paper_id}" if ps.paper_id else ""
+
+        records.append(
+            PublicDSLExport(
+                title=ps.title,
+                source_url=source_url,
+                original_license=ps.license,
+                metaweave_smiles=ps.abstract_structure.smiles_dsl,
+                context_summary=context_summary,
+            )
+        )
+
+    return PublicExportResponse(records=records, dropped_count=dropped)

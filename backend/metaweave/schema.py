@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class OntologyType(str, Enum):
@@ -289,3 +289,72 @@ class MissingLinkSuggestion(BaseModel):
         default_factory=list,
         description="List of field-specific search suggestions",
     )
+
+
+# ---------------------------------------------------------------------------
+# Export schemas (3 Zones + Gateway)
+# ---------------------------------------------------------------------------
+
+
+class DraftEntry(BaseModel):
+    """A single draft entry for private backup export."""
+
+    arxiv_id: str = Field(description="arXiv paper identifier")
+    structure: PaperStructure = Field(description="Draft PaperStructure")
+
+
+class ChatHistoryEntry(BaseModel):
+    """A single chat history entry for private backup export."""
+
+    arxiv_id: str = Field(description="arXiv paper identifier")
+    messages: list[dict] = Field(default_factory=list, description="Chat messages")
+
+
+class PrivateBackupExport(BaseModel):
+    """Private Zone のフルバックアップスキーマ。
+
+    ユーザー個人の生データ（ドラフト、チャット履歴、抽出途中のノード等）を
+    すべて保持する。文字数制限なし。外部共有は厳禁。
+    """
+
+    user_id: str = Field(description="Exporting user's identifier")
+    exported_at: str = Field(description="ISO 8601 timestamp of export")
+    drafts: list[DraftEntry] = Field(default_factory=list, description="All user drafts")
+    chat_histories: list[ChatHistoryEntry] = Field(
+        default_factory=list, description="All user chat histories"
+    )
+
+
+class PublicDSLExport(BaseModel):
+    """Public Zone / GitHub 公開用の厳格なエクスポートスキーマ。
+
+    Gateway を通過し、著者の「表現」を完全に除去した純粋な DSL のみを保持する。
+    ライセンス汚染（CC BY-NC, ND 等）のレコードは事前に除外済みであること。
+    """
+
+    title: str = Field(description="Paper title")
+    authors: list[str] = Field(default_factory=list, description="Author names")
+    source_url: str = Field(default="", description="Original paper URL")
+    doi: str = Field(default="", description="Digital Object Identifier")
+    original_license: str = Field(description="License of the original paper")
+    metaweave_smiles: str = Field(description="MetaWeave-SMILES DSL string")
+    is_derived_data: bool = Field(
+        default=True,
+        description="Flag indicating this is derived/extracted data, not original content",
+    )
+    disclaimer_implementation: str = Field(
+        default="本データは論文の論理構造を抽出したものであり、記述された技術の実施（商業利用等）に関する特許等の実施権を保証するものではありません。",
+        description="Patent/implementation rights disclaimer",
+    )
+    context_summary: str = Field(
+        default="",
+        description="200文字以内の事実の概要（脱表現化済み）",
+    )
+
+    @field_validator("context_summary")
+    @classmethod
+    def truncate_context_summary(cls, v: str) -> str:
+        """Enforce the 200-character hard limit for de-expression compliance."""
+        if len(v) > 200:
+            return v[:199] + "…"
+        return v
