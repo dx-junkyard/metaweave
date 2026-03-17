@@ -424,6 +424,28 @@ def api_get_missing_link_suggestions(pattern_id: str, refresh: bool = False) -> 
     return resp.json()
 
 
+def api_export_private(user_id: str) -> dict:
+    """GET /api/export/private/{user_id} — download private backup."""
+    resp = requests.get(
+        f"{BACKEND_URL}/api/export/private/{user_id}",
+        headers=_auth_headers(),
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def api_export_public() -> dict:
+    """GET /api/export/public/github — download sanitized public DSL export."""
+    resp = requests.get(
+        f"{BACKEND_URL}/api/export/public/github",
+        headers=_auth_headers(),
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def _auth_post(path: str, payload: dict) -> dict:
     """Helper: POST to an auth endpoint and return the response JSON dict."""
     resp = requests.post(f"{BACKEND_URL}{path}", json=payload, timeout=15)
@@ -571,6 +593,53 @@ with st.sidebar:
     st.markdown("## MetaWeave v1")
     st.caption(f"👤 {st.session_state.username}")
     page = st.radio("Navigation", ["Harvester Dashboard", "Validation View", "Pattern Library", "Cross-Domain Search", "🛠️ Meta Issues"])
+
+    # ── Data Management (Export) section ─────────────────────────────────
+    st.divider()
+    st.markdown("### 📦 データ管理")
+
+    # Private backup button
+    if st.button("🔒 私有地データのバックアップ (Private)", key="btn_export_private", use_container_width=True):
+        try:
+            _priv_data = api_export_private(st.session_state.user_id)
+            _priv_json = json.dumps(_priv_data, ensure_ascii=False, indent=2)
+            st.session_state["_private_export_json"] = _priv_json
+        except Exception as _e:
+            st.error(f"バックアップ取得に失敗しました: {_e}")
+
+    if st.session_state.get("_private_export_json"):
+        st.download_button(
+            label="⬇️ Private バックアップをダウンロード",
+            data=st.session_state["_private_export_json"],
+            file_name="metaweave_private_backup.json",
+            mime="application/json",
+            key="dl_private_export",
+            use_container_width=True,
+        )
+
+    # Public export button
+    if st.button("🌍 GitHub公開用シードのダウンロード (Public)", key="btn_export_public", use_container_width=True):
+        try:
+            _pub_data = api_export_public()
+            _pub_json = json.dumps(_pub_data, ensure_ascii=False, indent=2)
+            st.session_state["_public_export_json"] = _pub_json
+            _dropped = _pub_data.get("dropped_count", 0)
+            if _dropped:
+                st.info(f"ライセンス汚染により {_dropped} 件のレコードを除外しました。")
+        except Exception as _e:
+            st.error(f"Public エクスポート取得に失敗しました: {_e}")
+
+    if st.session_state.get("_public_export_json"):
+        st.download_button(
+            label="⬇️ Public DSL データをダウンロード",
+            data=st.session_state["_public_export_json"],
+            file_name="metaweave_public_dsl.json",
+            mime="application/json",
+            key="dl_public_export",
+            use_container_width=True,
+        )
+
+    st.caption("※ Public データは Gateway を通過済みの DSL のみを含みます。OSS 貢献者・管理者向けです。")
 
     if page == "Validation View":
         st.divider()
