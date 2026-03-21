@@ -20,7 +20,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, FieldCondition, Filter, MatchText, MatchValue, PointStruct, VectorParams
 
 from metaweave.llm import get_client, get_settings
-from metaweave.schema import PaperStructure
+from metaweave.schema import CausalEdge, PaperStructure
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,47 @@ def _ensure_collection() -> None:
             vectors_config=VectorParams(size=_VECTOR_DIM, distance=Distance.COSINE),
         )
         logger.info("Qdrant collection '%s' created (dim=%d)", _COLLECTION, _VECTOR_DIM)
+
+
+def _build_ancestors_map(edges: list[CausalEdge]) -> dict[str, list[str]]:
+    """CONTAINS エッジから各ノードの祖先（親ノード群）のマップを構築する。
+
+    絶対的な depth_level は使用せず、CONTAINS エッジの推移的閉包から
+    各ノードの祖先リスト（context_path / ancestors）を算出する。
+    これにより「特定のマクロなテーマに属するノード」のフィルタリングが可能になる。
+
+    Returns
+    -------
+    dict[str, list[str]]
+        ノード名 → 祖先ノード名のリスト（直近の親が先頭、ルートが末尾）。
+    """
+    # parent_of: child -> set of direct parents
+    parent_of: dict[str, set[str]] = {}
+    for edge in edges:
+        if edge.core_predicate.value == "CONTAINS":
+            parent_of.setdefault(edge.target, set()).add(edge.source)
+
+    if not parent_of:
+        return {}
+
+    def _get_ancestors(node: str, visited: set[str] | None = None) -> list[str]:
+        if visited is None:
+            visited = set()
+        if node in visited:
+            return []
+        visited.add(node)
+        result: list[str] = []
+        for parent in parent_of.get(node, []):
+            result.append(parent)
+            result.extend(_get_ancestors(parent, visited))
+        return result
+
+    ancestors_map: dict[str, list[str]] = {}
+    for child in parent_of:
+        ancestors = _get_ancestors(child)
+        if ancestors:
+            ancestors_map[child] = ancestors
+    return ancestors_map
 
 
 def embed_and_store(
@@ -98,6 +139,11 @@ def embed_and_store(
     if extracted_structure is not None:
         extra_payload["smiles_dsl"] = extracted_structure.abstract_structure.smiles_dsl
         extra_payload["variables"] = extracted_structure.abstract_structure.variables
+        # ancestors: CONTAINS エッジから各ノードの祖先（マクロ文脈）を構築
+        # 絶対的な depth_level は保存せず、相対的な祖先リストのみを保持する
+        ancestors_map = _build_ancestors_map(extracted_structure.abstract_structure.edges)
+        if ancestors_map:
+            extra_payload["ancestors"] = ancestors_map
 
     points: list[PointStruct] = []
     for i, vector in enumerate(all_embeddings):
