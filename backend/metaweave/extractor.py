@@ -288,6 +288,15 @@ def _generate_hypothesis(first_chunk: str, paper_id: str) -> dict[str, Any]:
     return result
 
 
+def _to_str(item: object) -> str:
+    """Coerce an item to a string — handles dicts returned by the LLM."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return json.dumps(item, ensure_ascii=False)
+    return str(item)
+
+
 def _refine_with_chunk(state: _AnalysisState, chunk: str, chunk_idx: int) -> None:
     """チャンクを読み込んで分析状態をインプレースで更新する。"""
     client = get_client()
@@ -297,7 +306,7 @@ def _refine_with_chunk(state: _AnalysisState, chunk: str, chunk_idx: int) -> Non
         f"Problem: {state.draft.get('problem', '')[:200]}\n"
         f"Hypothesis: {state.draft.get('hypothesis', '')[:200]}"
     )
-    confirmed_str = "; ".join(state.confirmed[-5:]) if state.confirmed else "none"
+    confirmed_str = "; ".join(_to_str(c) for c in state.confirmed[-5:]) if state.confirmed else "none"
 
     prompt = (
         f"[Chunk {chunk_idx}]\n"
@@ -341,8 +350,8 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
     client = get_client()
     settings = get_settings()
 
-    def _bullets(items: list[str], limit: int = 8) -> str:
-        return "\n".join(f"- {x}" for x in items[:limit]) or "none"
+    def _bullets(items: list, limit: int = 8) -> str:
+        return "\n".join(f"- {_to_str(x)}" for x in items[:limit]) or "none"
 
     state_str = (
         f"Confirmed findings:\n{_bullets(state.confirmed)}\n\n"

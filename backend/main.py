@@ -5,6 +5,7 @@ Endpoints
 GET  /api/search                        Search arXiv for papers.
 POST /api/search/structure              FANNS hybrid search (DSL regex + vector similarity).
 POST /api/fetch                         Download a paper PDF and store it in MinIO.
+POST /api/upload-pdf                    Upload a local PDF file and store it in MinIO.
 POST /api/extract                       Submit async background extraction job.
 GET  /api/extract-status/{arxiv_id}     Poll extraction job status (pending/processing/completed/failed).
 GET  /api/extract-result/{arxiv_id}     Fetch a previously extracted paper structure from MinIO.
@@ -37,7 +38,7 @@ import uuid
 from functools import lru_cache
 
 import jwt
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
@@ -49,7 +50,7 @@ from metaweave.chat import generate_chat_response
 from metaweave.db import create_system_meta_proposal, get_driver
 from metaweave.isom import serialize_isom, write_isom_file, write_batch_isom
 from metaweave.embedder import embed_and_store_pattern, search_fanns_hybrid
-from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
+from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv, store_uploaded_pdf
 from metaweave.llm import generate_missing_link_suggestions, get_client, get_settings
 from metaweave.schema import (
     AbstractionPattern,
@@ -731,6 +732,31 @@ def fetch(body: FetchRequest) -> FetchResponse:
         raise HTTPException(status_code=502, detail=f"Fetch failed: {exc}") from exc
 
     return FetchResponse(object_name=object_name)
+
+
+class UploadPdfResponse(BaseModel):
+    paper_id: str
+    object_name: str
+
+
+@app.post("/api/upload-pdf", response_model=UploadPdfResponse)
+async def upload_pdf(
+    file: UploadFile = File(...),
+    source_url: str = Form(""),
+    license: str = Form(""),
+) -> UploadPdfResponse:
+    """Upload a local PDF file and store it in MinIO."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+    pdf_data = await file.read()
+    if len(pdf_data) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    try:
+        paper_id, object_name = store_uploaded_pdf(pdf_data, file.filename, _storage())
+    except Exception as exc:
+        logger.exception("PDF upload/store failed")
+        raise HTTPException(status_code=502, detail=f"Upload failed: {exc}") from exc
+    return UploadPdfResponse(paper_id=paper_id, object_name=object_name)
 
 
 @app.post("/api/extract", response_model=ExtractAccepted)
