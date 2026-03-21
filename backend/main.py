@@ -1976,3 +1976,423 @@ def export_isom_batch(
 
     paths = write_batch_isom(structures)
     return IsomExportResponse(files_written=paths, count=len(paths))
+
+
+# ---------------------------------------------------------------------------
+# Learning UI endpoints
+# ---------------------------------------------------------------------------
+
+
+class LearningCourseOut(BaseModel):
+    """Summary of a learning course."""
+
+    id: str
+    title: str
+
+
+class LearningChapter(BaseModel):
+    title: str
+    status: str = "locked"  # completed | in_progress | locked
+    progress_pct: int = 0
+
+
+class LearningPrerequisite(BaseModel):
+    name: str
+    status: str = "not_started"  # mastered | partial | not_started
+
+
+class LearningMisconception(BaseModel):
+    label: str = ""
+    wrong: str
+    correct: str
+
+
+class LearningTopic(BaseModel):
+    id: str
+    title: str
+    chapter_index: int
+    status: str = "locked"  # completed | in_progress | locked
+    prerequisites: list[LearningPrerequisite] = []
+    misconceptions: list[LearningMisconception] = []
+
+
+class LearningConcept(BaseModel):
+    name: str
+    status: str = "future"  # mastered | learning | future
+    children: list[str] = []
+    expanded: bool = False
+
+
+class LearningSource(BaseModel):
+    title: str
+    subtitle: str = ""
+    license: str = ""
+    used_section: str = ""
+
+
+class LearningReferencedSection(BaseModel):
+    source: str
+    section: str
+    title: str
+    note: str = ""
+
+
+class LearningCourseDetail(BaseModel):
+    id: str
+    title: str
+    chapters: list[LearningChapter] = []
+    topics: list[LearningTopic] = []
+    concepts: list[LearningConcept] = []
+    sources: list[LearningSource] = []
+    referenced_sections: list[LearningReferencedSection] = []
+    progress: dict | None = None
+
+
+class LearningSession(BaseModel):
+    date: str
+    topic: str
+    duration: str
+
+
+class LearningProgress(BaseModel):
+    mastered_concepts: int = 0
+    learning_concepts: int = 0
+    misconceptions: int = 0
+    streak_days: int = 0
+    sessions: list[LearningSession] = []
+
+
+class LearningChatRequest(BaseModel):
+    message: str
+    history: list[dict] = []
+
+
+class LearningChatResponse(BaseModel):
+    answer: str
+    course_update: dict | None = None
+
+
+class LearningChatHistoryResponse(BaseModel):
+    history: list[dict]
+
+
+def _get_or_create_learning_node(driver, user_id: str, course_id: str) -> dict:
+    """Retrieve or create a LearningCourse node for the user in Neo4j."""
+    with driver.session() as session:
+        record = session.run(
+            """
+            MATCH (u:User {id: $user_id})-[:ENROLLED_IN]->(lc:LearningCourse {id: $course_id})
+            RETURN lc.data AS data
+            """,
+            user_id=user_id,
+            course_id=course_id,
+        ).single()
+        if record and record["data"]:
+            try:
+                return json.loads(record["data"])
+            except Exception:
+                pass
+    return {}
+
+
+def _save_learning_node(driver, user_id: str, course_id: str, data: dict) -> None:
+    """Persist learning course data to Neo4j."""
+    with driver.session() as session:
+        session.run(
+            """
+            MERGE (u:User {id: $user_id})
+            MERGE (lc:LearningCourse {id: $course_id})
+            MERGE (u)-[:ENROLLED_IN]->(lc)
+            SET lc.data = $data, lc.updated_at = $now
+            """,
+            user_id=user_id,
+            course_id=course_id,
+            data=json.dumps(data, ensure_ascii=False),
+            now=datetime.datetime.utcnow().isoformat(),
+        )
+
+
+def _default_course() -> dict:
+    """Return a default course structure for demonstration."""
+    return {
+        "id": "default",
+        "title": "場の量子論（基礎）",
+        "chapters": [
+            {"title": "古典場の理論", "status": "completed", "progress_pct": 100},
+            {"title": "正準量子化", "status": "completed", "progress_pct": 100},
+            {"title": "相互作用する場", "status": "in_progress", "progress_pct": 40},
+            {"title": "QED", "status": "locked", "progress_pct": 0},
+            {"title": "くりこみ", "status": "locked", "progress_pct": 0},
+            {"title": "非アーベルゲージ理論", "status": "locked", "progress_pct": 0},
+        ],
+        "topics": [
+            {"id": "3-1", "title": "摂動論", "chapter_index": 2, "status": "completed",
+             "prerequisites": [], "misconceptions": []},
+            {"id": "3-2", "title": "ファインマンダイアグラム", "chapter_index": 2, "status": "in_progress",
+             "prerequisites": [
+                 {"name": "摂動論", "status": "mastered"},
+                 {"name": "S行列", "status": "mastered"},
+                 {"name": "Wickの定理", "status": "partial"},
+                 {"name": "経路積分", "status": "not_started"},
+             ],
+             "misconceptions": [
+                 {"label": "本日の訂正", "wrong": "「仮想粒子 = 実在するが観測不可能」",
+                  "correct": "摂動展開の計算上の道具"},
+                 {"label": "前回セッション", "wrong": "「ハミルトニアン = ラグランジアン」",
+                  "correct": "Legendre変換の関係"},
+             ]},
+            {"id": "3-3", "title": "散乱断面積", "chapter_index": 2, "status": "locked",
+             "prerequisites": [], "misconceptions": []},
+        ],
+        "concepts": [
+            {"name": "ラグランジアン形式", "status": "mastered", "children": [], "expanded": False},
+            {"name": "Klein-Gordon方程式", "status": "mastered", "children": [], "expanded": False},
+            {"name": "ファインマン則", "status": "learning",
+             "children": ["プロパゲータ", "頂点因子", "組み合わせ因子"], "expanded": True},
+            {"name": "ループ積分", "status": "future", "children": [], "expanded": False},
+            {"name": "くりこみ", "status": "future", "children": [], "expanded": False},
+        ],
+        "sources": [
+            {"title": "Peskin & Schroeder",
+             "subtitle": "An Introduction to Quantum Field Theory",
+             "used_section": "今回参照: §4.7 (Feynman Rules)"},
+            {"title": "KEK 場の量子論 講義ノート",
+             "subtitle": "2025年度 前期講義", "license": "CC BY 4.0"},
+            {"title": "CERN Yellow Report: QFT Lectures",
+             "subtitle": "CERN Summer School 2024", "license": "CC BY 4.0"},
+        ],
+        "referenced_sections": [
+            {"source": "Peskin & Schroeder", "section": "§4.7",
+             "title": "Feynman Rules for Fermions", "note": "仮想粒子・プロパゲータの議論"},
+            {"source": "Peskin & Schroeder", "section": "§4.2",
+             "title": "Perturbation Expansion of Correlation Functions",
+             "note": "摂動展開とダイアグラムの対応"},
+            {"source": "KEK 講義ノート", "section": "第5回",
+             "title": "相互作用する場の量子論", "note": "ファインマンダイアグラムの導入"},
+        ],
+    }
+
+
+def _default_progress() -> dict:
+    """Return default progress data."""
+    return {
+        "mastered_concepts": 12,
+        "learning_concepts": 3,
+        "misconceptions": 2,
+        "streak_days": 7,
+        "sessions": [
+            {"date": "3/21", "topic": "ファインマンダイアグラム・仮想粒子", "duration": "25分"},
+            {"date": "3/20", "topic": "摂動論・相互作用ハミルトニアン", "duration": "40分"},
+            {"date": "3/18", "topic": "S行列・遷移振幅", "duration": "35分"},
+            {"date": "3/17", "topic": "正準交換関係・生成消滅演算子", "duration": "50分"},
+            {"date": "3/15", "topic": "Klein-Gordon場の量子化", "duration": "30分"},
+        ],
+    }
+
+
+@app.get("/api/learning/courses", response_model=list[LearningCourseOut])
+def list_learning_courses(
+    current_user: dict = Depends(_get_current_user),
+) -> list[LearningCourseOut]:
+    """ユーザーが登録している学習コースの一覧を返す。"""
+    driver = get_driver()
+    with driver.session() as session:
+        records = session.run(
+            """
+            MATCH (u:User {id: $user_id})-[:ENROLLED_IN]->(lc:LearningCourse)
+            RETURN lc.id AS id, lc.data AS data
+            """,
+            user_id=current_user["id"],
+        ).data()
+
+    courses = []
+    for r in records:
+        data = {}
+        if r.get("data"):
+            try:
+                data = json.loads(r["data"])
+            except Exception:
+                pass
+        courses.append(LearningCourseOut(
+            id=r["id"],
+            title=data.get("title", r["id"]),
+        ))
+
+    # If no courses exist yet, create a default one
+    if not courses:
+        default = _default_course()
+        _save_learning_node(driver, current_user["id"], default["id"], default)
+        courses.append(LearningCourseOut(id=default["id"], title=default["title"]))
+
+    return courses
+
+
+@app.get("/api/learning/courses/{course_id}", response_model=LearningCourseDetail)
+def get_learning_course(
+    course_id: str,
+    current_user: dict = Depends(_get_current_user),
+) -> LearningCourseDetail:
+    """学習コースの詳細データを返す。"""
+    driver = get_driver()
+    data = _get_or_create_learning_node(driver, current_user["id"], course_id)
+
+    if not data:
+        data = _default_course()
+        _save_learning_node(driver, current_user["id"], course_id, data)
+
+    return LearningCourseDetail(**data)
+
+
+@app.get("/api/learning/courses/{course_id}/progress", response_model=LearningProgress)
+def get_learning_progress(
+    course_id: str,
+    current_user: dict = Depends(_get_current_user),
+) -> LearningProgress:
+    """学習コースの進捗データを返す。"""
+    driver = get_driver()
+    data = _get_or_create_learning_node(driver, current_user["id"], course_id)
+
+    progress_data = data.get("progress") if data else None
+    if not progress_data:
+        progress_data = _default_progress()
+
+    return LearningProgress(**progress_data)
+
+
+@app.get(
+    "/api/learning/courses/{course_id}/topics/{topic_id}/chat",
+    response_model=LearningChatHistoryResponse,
+)
+def get_learning_chat_history(
+    course_id: str,
+    topic_id: str,
+    current_user: dict = Depends(_get_current_user),
+) -> LearningChatHistoryResponse:
+    """特定トピックのチャット履歴を返す。"""
+    driver = get_driver()
+    with driver.session() as session:
+        record = session.run(
+            """
+            MATCH (u:User {id: $user_id})-[r:LEARNING_CHAT]->(lt:LearningTopic {id: $topic_id, course_id: $course_id})
+            RETURN r.history AS history
+            """,
+            user_id=current_user["id"],
+            topic_id=topic_id,
+            course_id=course_id,
+        ).single()
+
+    if not record or not record.get("history"):
+        return LearningChatHistoryResponse(history=[])
+
+    try:
+        history = json.loads(record["history"])
+    except Exception:
+        history = []
+
+    return LearningChatHistoryResponse(history=history)
+
+
+_LEARNING_SYSTEM_PROMPT = """あなたは高等物理学の家庭教師です。学生の理解を深めるために以下の原則に従ってください。
+
+**教育方針:**
+1. 学生の誤解を発見したら、まず訂正し、なぜその誤解が生じやすいか説明してください。
+2. 概念の説明は具体的な数式や例を使って行ってください。
+3. 説明の最後に、理解を確認するための質問をしてください。
+4. 関連する概念へのドリルダウン選択肢を提示してください。
+
+**フォーマット:**
+- 誤解の訂正が必要な場合は、最初に明示的に「訂正：」と記述してください。
+- 参照した教材のセクションがあれば言及してください。
+- 回答の末尾に、深掘りできるトピックを `[〇〇について詳しく聞く]` の形式で提示してください。
+
+学生のレベルに合わせて説明の深さを調整してください。"""
+
+
+@app.post(
+    "/api/learning/courses/{course_id}/topics/{topic_id}/chat",
+    response_model=LearningChatResponse,
+)
+def learning_chat(
+    course_id: str,
+    topic_id: str,
+    body: LearningChatRequest,
+    current_user: dict = Depends(_get_current_user),
+) -> LearningChatResponse:
+    """学習チャットエンドポイント。トピックに特化したRAGベースの対話。"""
+    settings = get_settings()
+    client = get_client()
+
+    # Load course data for context
+    driver = get_driver()
+    course_data = _get_or_create_learning_node(driver, current_user["id"], course_id)
+    if not course_data:
+        course_data = _default_course()
+
+    # Find current topic info
+    topic_info = None
+    for t in course_data.get("topics", []):
+        if t.get("id") == topic_id:
+            topic_info = t
+            break
+
+    topic_title = topic_info["title"] if topic_info else topic_id
+
+    # Build messages
+    messages: list[dict] = [
+        {"role": "system", "content": _LEARNING_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            f"現在のトピック: {topic_title}\n"
+            f"コース: {course_data.get('title', course_id)}\n"
+            f"このコンテキストを念頭に置いて質問に回答してください。"
+        )},
+        {"role": "assistant", "content": (
+            f"了解しました。{topic_title}について学習を進めましょう。"
+            "何でも質問してください。"
+        )},
+    ]
+
+    # Add history
+    for turn in body.history:
+        messages.append({"role": turn["role"], "content": turn["content"]})
+
+    messages.append({"role": "user", "content": body.message})
+
+    # Call LLM
+    try:
+        response = client.chat.completions.create(
+            model=settings.analysis_model,
+            messages=messages,
+            temperature=0.3,
+        )
+        answer = response.choices[0].message.content or ""
+    except Exception as exc:
+        logger.exception("Learning chat failed for topic %s", topic_id)
+        raise HTTPException(status_code=500, detail=f"Chat failed: {exc}") from exc
+
+    # Persist chat history
+    updated_history = body.history + [
+        {"role": "user", "content": body.message},
+        {"role": "assistant", "content": answer},
+    ]
+    try:
+        with driver.session() as session:
+            session.run(
+                """
+                MERGE (u:User {id: $user_id})
+                MERGE (lt:LearningTopic {id: $topic_id, course_id: $course_id})
+                MERGE (u)-[r:LEARNING_CHAT]->(lt)
+                SET r.history = $history
+                """,
+                user_id=current_user["id"],
+                topic_id=topic_id,
+                course_id=course_id,
+                history=json.dumps(updated_history, ensure_ascii=False),
+            )
+    except Exception:
+        logger.exception(
+            "Failed to persist learning chat for user=%s topic=%s",
+            current_user["id"],
+            topic_id,
+        )
+
+    return LearningChatResponse(answer=answer)
