@@ -35,6 +35,8 @@ class CorePredicate(str, Enum):
     MEASURES = "MEASURES"
     TRANSFORMS = "TRANSFORMS"
     REQUIRES = "REQUIRES"
+    CONTAINS = "CONTAINS"
+    EQUIVALENT = "EQUIVALENT"
 
 
 class MetaIssueCategory(str, Enum):
@@ -89,13 +91,32 @@ class CausalEdge(BaseModel):
     target: str = Field(description="Target variable")
     core_predicate: CorePredicate = Field(
         default=CorePredicate.CAUSES,
-        description="Standardized predicate for cross-domain Neo4j search (CAUSES, INHIBITS, CORRELATES, DEFINES, MEASURES, TRANSFORMS, REQUIRES)",
+        description=(
+            "Standardized predicate for cross-domain Neo4j search "
+            "(CAUSES, INHIBITS, CORRELATES, DEFINES, MEASURES, TRANSFORMS, "
+            "REQUIRES, CONTAINS, EQUIVALENT)"
+        ),
     )
     domain_verb: str = Field(
         default="causes",
-        description="Domain-specific verb describing the relation (e.g., operationalizes, structures, quantifies)",
+        description="Domain-specific verb describing the relation (e.g., operationalizes, structures, quantifies, contains, equals)",
     )
-    polarity: str = Field(default="+", description="Causal polarity (+/-)")
+    polarity: str = Field(
+        default="+",
+        description=(
+            "Edge polarity: '+' (positive/促進), '-' (negative/抑制), "
+            "'+/-' (conditional/bidirectional — context-dependent positive or negative), "
+            "'?' (unknown direction — impact exists but polarity is unclear)"
+        ),
+    )
+
+    @field_validator("polarity")
+    @classmethod
+    def validate_polarity(cls, v: str) -> str:
+        allowed = {"+", "-", "+/-", "?"}
+        if v not in allowed:
+            raise ValueError(f"polarity must be one of {allowed}, got '{v}'")
+        return v
     ontology_level: str = Field(default="", description="Ontology relation type (e.g., Intentional Moment)")
     is_core: bool = Field(
         default=True,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import requests
 import streamlit as st
@@ -77,6 +78,9 @@ if "xd_searched" not in st.session_state:
 # Missing Link Suggestion キャッシュ: pattern_id -> suggestion response dict
 if "missing_link_suggestions" not in st.session_state:
     st.session_state.missing_link_suggestions: dict[str, dict] = {}
+# 説明リンクから自動セットされた次の質問: arxiv_id -> question str
+if "pending_chat_question" not in st.session_state:
+    st.session_state.pending_chat_question: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1297,12 +1301,38 @@ elif page == "Validation View":
                     if chat_history:
                         if st.button("🗑️ Clear chat history", key=f"clear_chat_{active_id}"):
                             st.session_state.chat_histories[active_id] = []
+                            st.session_state.pending_chat_question.pop(active_id, None)
                             st.rerun()
 
+                    def _render_assistant_message(text: str, msg_idx: int) -> None:
+                        """Render assistant message with clickable explanation link buttons."""
+                        # Pattern: [〇〇について詳しく聞く] (full-width or half-width brackets)
+                        link_pattern = re.compile(r"\[([^\[\]]+について詳しく聞く)\]")
+                        matches = link_pattern.findall(text)
+                        st.markdown(text)
+                        if matches:
+                            st.caption("関連トピックを深掘り:")
+                            for link_idx, link_text in enumerate(matches):
+                                # Extract the topic from "〇〇について詳しく聞く"
+                                topic = link_text.replace("について詳しく聞く", "")
+                                question = f"{topic}について教えてください"
+                                if st.button(
+                                    f"🔍 {link_text}",
+                                    key=f"drilldown_{active_id}_{msg_idx}_{link_idx}",
+                                ):
+                                    st.session_state.pending_chat_question[active_id] = question
+                                    st.rerun()
+
                     # 過去のメッセージを表示
-                    for turn in chat_history:
+                    for msg_idx, turn in enumerate(chat_history):
                         with st.chat_message(turn["role"]):
-                            st.markdown(turn["content"])
+                            if turn["role"] == "assistant":
+                                _render_assistant_message(turn["content"], msg_idx)
+                            else:
+                                st.markdown(turn["content"])
+
+                    # 説明リンクからの自動質問 or 手動入力
+                    pending_q = st.session_state.pending_chat_question.pop(active_id, None)
 
                     # 入力欄
                     user_input = st.chat_input(
@@ -1311,12 +1341,15 @@ elif page == "Validation View":
                         disabled=is_processing,
                     )
 
+                    # 説明リンクからの自動質問を優先
+                    effective_input = pending_q or user_input
+
                     if is_processing:
                         st.info("解析処理完了後にチャットを利用できます。")
-                    elif user_input:
+                    elif effective_input:
                         # ユーザーメッセージを即座に表示
                         with st.chat_message("user"):
-                            st.markdown(user_input)
+                            st.markdown(effective_input)
 
                         # バックエンドを呼び出して回答を生成
                         with st.chat_message("assistant"):
@@ -1324,13 +1357,13 @@ elif page == "Validation View":
                                 try:
                                     answer = api_chat(
                                         arxiv_id=active_id,
-                                        message=user_input,
+                                        message=effective_input,
                                         history=chat_history,
                                     )
-                                    st.markdown(answer)
+                                    _render_assistant_message(answer, len(chat_history) + 1)
                                     # 履歴に追加
                                     st.session_state.chat_histories[active_id].append(
-                                        {"role": "user", "content": user_input}
+                                        {"role": "user", "content": effective_input}
                                     )
                                     st.session_state.chat_histories[active_id].append(
                                         {"role": "assistant", "content": answer}
