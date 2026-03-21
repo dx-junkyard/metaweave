@@ -137,3 +137,20 @@ def fetch_and_store(meta: PaperMeta, storage: StorageManager) -> str:
 
     storage.upload_pdf("raw-papers", object_name, resp.content)
     return object_name
+
+
+def store_uploaded_pdf(
+    pdf_data: bytes,
+    filename: str,
+    storage: StorageManager,
+) -> tuple[str, str]:
+    """Store a user-uploaded PDF in MinIO.
+
+    Returns (paper_id, object_name).
+    """
+    safe_name = re.sub(r"[^\w.\-]", "_", filename.rsplit(".", 1)[0])
+    paper_id = f"upload_{safe_name}"
+    object_name = f"uploads/{paper_id}.pdf"
+
+    storage.upload_pdf("raw-papers", object_name, pdf_data)
+    return paper_id, object_name

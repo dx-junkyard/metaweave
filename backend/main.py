@@ -5,6 +5,7 @@ Endpoints
 GET  /api/search                        Search arXiv for papers.
 POST /api/search/structure              FANNS hybrid search (DSL regex + vector similarity).
 POST /api/fetch                         Download a paper PDF and store it in MinIO.
+POST /api/upload-pdf                    Upload a local PDF file and store it in MinIO.
 POST /api/extract                       Submit async background extraction job.
 GET  /api/extract-status/{arxiv_id}     Poll extraction job status (pending/processing/completed/failed).
 GET  /api/extract-result/{arxiv_id}     Fetch a previously extracted paper structure from MinIO.
@@ -20,6 +21,8 @@ POST /api/auth/register                 Register a new user (Neo4j User node, re
 POST /api/auth/login                    Authenticate and return a JWT.
 GET  /api/auth/me                       Return the current user's profile (requires Bearer token).
 GET  /api/patterns/{pattern_id}/suggestions  Missing link suggestions for a pattern.
+GET  /api/export/private/{user_id}     Export user's private data (drafts, chat history) as JSON.
+GET  /api/export/public/github         Export sanitized public DSL data for GitHub (Gateway-filtered).
 GET  /healthz                           Health check.
 """
 
@@ -35,7 +38,7 @@ import uuid
 from functools import lru_cache
 
 import jwt
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
@@ -44,17 +47,24 @@ from pydantic import BaseModel
 from metaweave import extractor as ext
 from metaweave.batch import run_pattern_evaluation_task
 from metaweave.chat import generate_chat_response
-from metaweave.db import get_driver
+from metaweave.db import create_system_meta_proposal, get_driver
+from metaweave.isom import serialize_isom, write_isom_file, write_batch_isom
 from metaweave.embedder import embed_and_store_pattern, search_fanns_hybrid
-from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
+from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv, store_uploaded_pdf
 from metaweave.llm import generate_missing_link_suggestions, get_client, get_settings
 from metaweave.schema import (
     AbstractionPattern,
+    ChatHistoryEntry,
+    DraftEntry,
     FieldSuggestion,
+    MetaIssueCategory,
     MissingLinkSuggestion,
     PaperStructure,
     PatternMatch,
+    PrivateBackupExport,
+    PublicDSLExport,
     StructureProposal,
+    SystemMetaProposal,
 )
 from metaweave.storage import StorageManager
 
@@ -185,6 +195,7 @@ class ProposeStructureRequest(BaseModel):
     arxiv_id: str
     user_id: str
     proposed_structure: PaperStructure
+    meta_feedback: str = ""
 
 
 class ProposeStructureResponse(BaseModel):
@@ -203,6 +214,25 @@ class ProposalItem(BaseModel):
     status: str
     evaluation_reasoning: str | None = None
     created_at: str | None = None
+    meta_feedback: str | None = None
+
+
+class MetaProposalItem(BaseModel):
+    """Single meta-proposal entry for API responses."""
+
+    meta_proposal_id: str
+    category: str
+    description: str
+    suggested_solution: str
+    source_proposal_id: str = ""
+    arxiv_id: str = ""
+    created_at: str | None = None
+
+
+class MetaProposalListResponse(BaseModel):
+    """Response body for GET /api/meta-proposals."""
+
+    meta_proposals: list[MetaProposalItem]
 
 
 class ProposalListResponse(BaseModel):
@@ -460,6 +490,13 @@ def _run_extraction_task(
                 length=len(json_bytes),
                 content_type="application/json",
             )
+            # 3c. .isom ファイルを output/incoming/ に書き出し
+            try:
+                write_isom_file(structure)
+            except Exception:
+                logger.warning(
+                    "Failed to write .isom file for %s (continuing)", arxiv_id, exc_info=True
+                )
             logger.info("Background extraction completed for %s", arxiv_id)
 
         with _job_lock:
@@ -695,6 +732,31 @@ def fetch(body: FetchRequest) -> FetchResponse:
         raise HTTPException(status_code=502, detail=f"Fetch failed: {exc}") from exc
 
     return FetchResponse(object_name=object_name)
+
+
+class UploadPdfResponse(BaseModel):
+    paper_id: str
+    object_name: str
+
+
+@app.post("/api/upload-pdf", response_model=UploadPdfResponse)
+async def upload_pdf(
+    file: UploadFile = File(...),
+    source_url: str = Form(""),
+    license: str = Form(""),
+) -> UploadPdfResponse:
+    """Upload a local PDF file and store it in MinIO."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+    pdf_data = await file.read()
+    if len(pdf_data) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    try:
+        paper_id, object_name = store_uploaded_pdf(pdf_data, file.filename, _storage())
+    except Exception as exc:
+        logger.exception("PDF upload/store failed")
+        raise HTTPException(status_code=502, detail=f"Upload failed: {exc}") from exc
+    return UploadPdfResponse(paper_id=paper_id, object_name=object_name)
 
 
 @app.post("/api/extract", response_model=ExtractAccepted)
@@ -959,12 +1021,109 @@ def get_chat_history(
 # Background LLM review task
 # ---------------------------------------------------------------------------
 
+def _analyze_meta_feedback(proposal: StructureProposal) -> None:
+    """meta_feedback を LLM で分析し、表現モデルの限界に関する体系的課題を検出する。
+
+    意味のあるメタ提案が検出された場合、SystemMetaProposal ノードを Neo4j に作成し、
+    元の StructureProposal および Paper との関係を設定する。
+    """
+    if not proposal.meta_feedback or not proposal.meta_feedback.strip():
+        return
+
+    try:
+        client = get_client()
+        settings = get_settings()
+    except Exception:
+        logger.warning("LLM client not available — skipping meta-feedback analysis")
+        return
+
+    prompt = f"""You are a systems analyst for the MetaWeave structural knowledge engine.
+
+MetaWeave represents paper structures using a SMILES-like DSL with:
+- Typed nodes (Agent, Resource, Event, etc.)
+- Directed edges with core predicates (CAUSES, INHIBITS, CORRELATES, DEFINES, MEASURES, TRANSFORMS, REQUIRES)
+- Polarity (+/-) and core/peripheral flags
+
+A user has submitted feedback suggesting that this representation model may be insufficient
+for expressing the structure of a particular paper.
+
+## User's Meta-Feedback
+{proposal.meta_feedback}
+
+## Paper arXiv ID
+{proposal.arxiv_id}
+
+## Your Task
+Analyze whether this feedback describes a **systemic limitation** of the expression model
+(not just a data correction). If it does, classify the issue and suggest a solution.
+
+## Output Format (strict JSON)
+If the feedback describes a genuine expression model limitation:
+{{
+  "is_systemic": true,
+  "category": "<one of: missing_edge_type, missing_ontology_level, temporal_limitation, multi_scale_limitation, bidirectional_limitation, other>",
+  "description": "<detailed description of the limitation>",
+  "suggested_solution": "<proposed approach to address it>"
+}}
+
+If the feedback is just a data correction or not about expression model limitations:
+{{
+  "is_systemic": false
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model=settings.analysis_model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.choices[0].message.content or "{}"
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            lines = [ln for ln in lines if not ln.strip().startswith("```")]
+            cleaned = "\n".join(lines)
+
+        result = json.loads(cleaned)
+    except Exception:
+        logger.exception("Meta-feedback LLM analysis failed for proposal %s", proposal.proposal_id)
+        return
+
+    if not result.get("is_systemic"):
+        logger.info("Meta-feedback for proposal %s is not systemic — skipping", proposal.proposal_id)
+        return
+
+    # SystemMetaProposal を Neo4j に保存（db.py のヘルパーを使用）
+    meta = SystemMetaProposal(
+        category=MetaIssueCategory(result.get("category", "other")),
+        description=result.get("description", ""),
+        suggested_solution=result.get("suggested_solution", ""),
+        source_proposal_id=proposal.proposal_id,
+        arxiv_id=proposal.arxiv_id,
+    )
+    created_at = datetime.datetime.utcnow().isoformat()
+    try:
+        create_system_meta_proposal(
+            meta_issue_id=meta.meta_proposal_id,
+            issue_type=meta.category.value,
+            description=meta.description,
+            suggested_solution=meta.suggested_solution,
+            source_proposal_id=meta.source_proposal_id,
+            arxiv_id=meta.arxiv_id,
+            created_at=created_at,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to save SystemMetaProposal for proposal %s", proposal.proposal_id
+        )
+
+
 def _run_review_task(proposal: StructureProposal) -> None:
     """バックグラウンドで実行される LLM 提案レビュータスク。
 
     1. MinIO から正典構造を取得（なければ提案構造を正典として扱う）
     2. evaluate_and_merge_proposals でマージ評価
     3. Neo4j の提案ノードに結果を書き戻す
+    4. meta_feedback があれば LLM で分析し SystemMetaProposal を生成
     """
     driver = get_driver()
 
@@ -1032,6 +1191,9 @@ def _run_review_task(proposal: StructureProposal) -> None:
         new_status,
     )
 
+    # 5. meta_feedback がある場合、LLM で分析して SystemMetaProposal を生成
+    _analyze_meta_feedback(proposal)
+
 
 # ---------------------------------------------------------------------------
 # Proposal endpoint
@@ -1055,6 +1217,7 @@ def propose_structure(
         arxiv_id=body.arxiv_id,
         user_id=body.user_id,
         proposed_structure=body.proposed_structure,
+        meta_feedback=body.meta_feedback,
     )
 
     # Neo4j への保存
@@ -1070,6 +1233,7 @@ def propose_structure(
                     arxiv_id:           $arxiv_id,
                     user_id:            $user_id,
                     proposed_structure: $proposed_structure,
+                    meta_feedback:      $meta_feedback,
                     status:             'pending',
                     created_at:         $created_at
                 })
@@ -1079,6 +1243,7 @@ def propose_structure(
                 proposal_id=proposal_id,
                 arxiv_id=body.arxiv_id,
                 proposed_structure=body.proposed_structure.model_dump_json(),
+                meta_feedback=body.meta_feedback,
                 created_at=created_at,
             )
     except Exception as exc:
@@ -1112,7 +1277,8 @@ def get_proposals(
                    u.username          AS username,
                    p.status            AS status,
                    p.evaluation_reasoning AS evaluation_reasoning,
-                   p.created_at        AS created_at
+                   p.created_at        AS created_at,
+                   p.meta_feedback     AS meta_feedback
             ORDER BY p.created_at DESC
             """,
             arxiv_id=arxiv_id,
@@ -1126,10 +1292,65 @@ def get_proposals(
             status=r["status"] or "pending",
             evaluation_reasoning=r.get("evaluation_reasoning"),
             created_at=r.get("created_at"),
+            meta_feedback=r.get("meta_feedback"),
         )
         for r in records
     ]
     return ProposalListResponse(proposals=proposals)
+
+
+@app.get("/api/meta-proposals", response_model=MetaProposalListResponse)
+def get_meta_proposals(
+    arxiv_id: str | None = Query(default=None, description="Filter by arXiv ID"),
+    category: str | None = Query(default=None, description="Filter by issue category"),
+    current_user: dict = Depends(_get_current_user),
+) -> MetaProposalListResponse:
+    """SystemMetaProposal の一覧を Neo4j から取得する。
+
+    arxiv_id や category でフィルタリング可能。
+    """
+    where_clauses: list[str] = []
+    params: dict = {}
+    if arxiv_id:
+        where_clauses.append("m.arxiv_id = $arxiv_id")
+        params["arxiv_id"] = arxiv_id
+    if category:
+        where_clauses.append("(m.issue_type = $category OR m.category = $category)")
+        params["category"] = category
+
+    where_str = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+    driver = get_driver()
+    with driver.session() as session:
+        records = session.run(
+            f"""
+            MATCH (m:SystemMetaProposal)
+            {where_str}
+            RETURN coalesce(m.meta_issue_id, m.meta_proposal_id) AS meta_proposal_id,
+                   coalesce(m.issue_type, m.category)            AS category,
+                   m.description         AS description,
+                   m.suggested_solution  AS suggested_solution,
+                   m.source_proposal_id  AS source_proposal_id,
+                   m.arxiv_id            AS arxiv_id,
+                   m.created_at          AS created_at
+            ORDER BY m.created_at DESC
+            """,
+            **params,
+        ).data()
+
+    meta_proposals = [
+        MetaProposalItem(
+            meta_proposal_id=r["meta_proposal_id"] or "",
+            category=r.get("category") or "other",
+            description=r.get("description", ""),
+            suggested_solution=r.get("suggested_solution", ""),
+            source_proposal_id=r.get("source_proposal_id", ""),
+            arxiv_id=r.get("arxiv_id", ""),
+            created_at=r.get("created_at"),
+        )
+        for r in records
+    ]
+    return MetaProposalListResponse(meta_proposals=meta_proposals)
 
 
 # ---------------------------------------------------------------------------
@@ -1553,3 +1774,205 @@ def get_pattern_suggestions(
         suggestions=[SuggestionOut(**s) for s in suggestions],
         cached=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# Export endpoints (3 Zones + Gateway)
+# ---------------------------------------------------------------------------
+
+
+class PrivateExportResponse(BaseModel):
+    """Response wrapper for GET /api/export/private/{user_id}."""
+
+    export: PrivateBackupExport
+
+
+class PublicExportResponse(BaseModel):
+    """Response for GET /api/export/public/github."""
+
+    records: list[PublicDSLExport]
+    dropped_count: int = 0
+
+
+@app.get("/api/export/private/{user_id}", response_model=PrivateExportResponse)
+def export_private(
+    user_id: str,
+    current_user: dict = Depends(_get_current_user),
+) -> PrivateExportResponse:
+    """Private Zone バックアップ: ユーザー個人のドラフトとチャット履歴をフルエクスポートする。"""
+    if user_id != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You can only export your own data")
+
+    driver = get_driver()
+
+    # ── 1. Collect all drafts ────────────────────────────────────────────
+    drafts: list[DraftEntry] = []
+    with driver.session() as session:
+        records = session.run(
+            """
+            MATCH (u:User {id: $uid})-[:HAS_DRAFT]->(d:Draft)
+            RETURN d.arxiv_id AS arxiv_id, d.structure AS structure
+            """,
+            uid=user_id,
+        ).data()
+    for rec in records:
+        aid = rec.get("arxiv_id", "")
+        raw = rec.get("structure", "")
+        if not raw:
+            continue
+        try:
+            ps = PaperStructure.model_validate_json(raw)
+            drafts.append(DraftEntry(arxiv_id=aid, structure=ps))
+        except Exception:
+            logger.warning("Skipping unparseable draft for arxiv_id=%s", aid)
+
+    # ── 2. Collect all chat histories ────────────────────────────────────
+    chat_histories: list[ChatHistoryEntry] = []
+    with driver.session() as session:
+        records = session.run(
+            """
+            MATCH (u:User {id: $uid})-[r:CHATTED_ABOUT]->(p:Paper)
+            RETURN p.arxiv_id AS arxiv_id, r.history AS history
+            """,
+            uid=user_id,
+        ).data()
+    for rec in records:
+        aid = rec.get("arxiv_id", "")
+        raw_hist = rec.get("history", "")
+        if not raw_hist:
+            continue
+        try:
+            messages = json.loads(raw_hist) if isinstance(raw_hist, str) else raw_hist
+        except Exception:
+            messages = []
+        chat_histories.append(ChatHistoryEntry(arxiv_id=aid, messages=messages))
+
+    export = PrivateBackupExport(
+        user_id=user_id,
+        exported_at=datetime.datetime.utcnow().isoformat(),
+        drafts=drafts,
+        chat_histories=chat_histories,
+    )
+    return PrivateExportResponse(export=export)
+
+
+import re as _re
+
+_LICENSE_CONTAMINATION_RE = _re.compile(r"\b(NC|ND|NoDerivatives|NonCommercial)\b", _re.IGNORECASE)
+
+
+@app.get("/api/export/public/github", response_model=PublicExportResponse)
+def export_public_github(
+    current_user: dict = Depends(_get_current_user),
+) -> PublicExportResponse:
+    """Public Zone エクスポート: Gateway を通過した DSL のみを返却する。
+
+    ライセンス汚染（NC / ND）を含むレコードは完全に除外（Drop）する。
+    """
+    sm = StorageManager()
+    bucket = "extracted-structures"
+
+    # ── 1. List all extracted structures from MinIO ───────────────────────
+    try:
+        objects = sm.client.list_objects(bucket, recursive=True)
+        object_names = [obj.object_name for obj in objects]
+    except Exception:
+        logger.warning("Failed to list objects in bucket=%s", bucket)
+        object_names = []
+
+    records: list[PublicDSLExport] = []
+    dropped = 0
+
+    for obj_name in object_names:
+        # ── 2. Load and parse PaperStructure ─────────────────────────────
+        try:
+            resp = sm.client.get_object(bucket, obj_name)
+            raw = resp.read()
+            resp.close()
+            resp.release_conn()
+            ps = PaperStructure.model_validate_json(raw)
+        except Exception:
+            logger.warning("Skipping unparseable object %s", obj_name)
+            continue
+
+        # ── 3. Gateway: drop license-contaminated records ────────────────
+        if _LICENSE_CONTAMINATION_RE.search(ps.license):
+            dropped += 1
+            continue
+
+        # ── 4. Build context_summary from problem/hypothesis (de-expressed) ─
+        summary_parts = []
+        if ps.problem.problem:
+            summary_parts.append(ps.problem.problem)
+        if ps.hypothesis.statement:
+            summary_parts.append(ps.hypothesis.statement)
+        context_summary = " ".join(summary_parts)
+
+        # Derive arXiv URL from paper_id
+        source_url = f"https://arxiv.org/abs/{ps.paper_id}" if ps.paper_id else ""
+
+        records.append(
+            PublicDSLExport(
+                title=ps.title,
+                source_url=source_url,
+                original_license=ps.license,
+                metaweave_smiles=ps.abstract_structure.smiles_dsl,
+                context_summary=context_summary,
+            )
+        )
+
+    return PublicExportResponse(records=records, dropped_count=dropped)
+
+
+# ---------------------------------------------------------------------------
+# Batch .isom export endpoint
+# ---------------------------------------------------------------------------
+
+
+class IsomExportResponse(BaseModel):
+    """Response for POST /api/export/isom."""
+
+    files_written: list[str]
+    count: int
+
+
+@app.post("/api/export/isom", response_model=IsomExportResponse)
+def export_isom_batch(
+    current_user: dict = Depends(_get_current_user),
+) -> IsomExportResponse:
+    """Batch export: write all extracted structures as individual .isom files.
+
+    Each paper's structure is written to output/incoming/ as
+    temp_[source_id_hash].isom for downstream OSL processing.
+    License-contaminated records (NC/ND) are excluded.
+    """
+    sm = StorageManager()
+    bucket = "extracted-structures"
+
+    try:
+        objects = sm.client.list_objects(bucket, recursive=True)
+        object_names = [obj.object_name for obj in objects]
+    except Exception:
+        logger.warning("Failed to list objects in bucket=%s", bucket)
+        object_names = []
+
+    structures: list[PaperStructure] = []
+    for obj_name in object_names:
+        try:
+            resp = sm.client.get_object(bucket, obj_name)
+            raw = resp.read()
+            resp.close()
+            resp.release_conn()
+            ps = PaperStructure.model_validate_json(raw)
+        except Exception:
+            logger.warning("Skipping unparseable object %s", obj_name)
+            continue
+
+        # Skip license-contaminated records
+        if _LICENSE_CONTAMINATION_RE.search(ps.license):
+            continue
+
+        structures.append(ps)
+
+    paths = write_batch_isom(structures)
+    return IsomExportResponse(files_written=paths, count=len(paths))

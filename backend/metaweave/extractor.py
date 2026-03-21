@@ -288,6 +288,15 @@ def _generate_hypothesis(first_chunk: str, paper_id: str) -> dict[str, Any]:
     return result
 
 
+def _to_str(item: object) -> str:
+    """Coerce an item to a string — handles dicts returned by the LLM."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        return json.dumps(item, ensure_ascii=False)
+    return str(item)
+
+
 def _refine_with_chunk(state: _AnalysisState, chunk: str, chunk_idx: int) -> None:
     """チャンクを読み込んで分析状態をインプレースで更新する。"""
     client = get_client()
@@ -297,13 +306,24 @@ def _refine_with_chunk(state: _AnalysisState, chunk: str, chunk_idx: int) -> Non
         f"Problem: {state.draft.get('problem', '')[:200]}\n"
         f"Hypothesis: {state.draft.get('hypothesis', '')[:200]}"
     )
-    confirmed_str = "; ".join(state.confirmed[-5:]) if state.confirmed else "none"
+    confirmed_str = "; ".join(_to_str(c) for c in state.confirmed[-5:]) if state.confirmed else "none"
 
     prompt = (
         f"[Chunk {chunk_idx}]\n"
         f"Initial draft:\n{draft_str}\n"
         f"Confirmed so far: {confirmed_str}\n\n"
         f"New chunk:\n{chunk}\n\n"
+        "=== Structure Extraction Rules ===\n"
+        "1. When you extract new elements or causal relationships, ALWAYS identify where they sit "
+        "within the paper's overall structure (macro context).\n"
+        "2. If an element is a constituent of a larger concept, identify the parent node and note "
+        "a CONTAINS relationship (parent contains child) for later DSL encoding.\n"
+        "3. If elements have prerequisite/dependency or contrast/equivalence relationships, note them "
+        "as REQUIRES (dependency) or EQUIVALENT (equivalence/contrast) lateral relationships.\n\n"
+        "=== Polarity Rules ===\n"
+        "For causal polarity, do NOT force '+' or '-' when direction is ambiguous:\n"
+        "- Use '+/-' when the effect is bidirectional or context-dependent.\n"
+        "- Use '?' when impact exists but polarity direction is unknown.\n\n"
         "Return JSON only "
         '(keys: "confirmed"[], "revised"[], "new_info"[], "pending"[], "summary" str):'
     )
@@ -330,8 +350,8 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
     client = get_client()
     settings = get_settings()
 
-    def _bullets(items: list[str], limit: int = 8) -> str:
-        return "\n".join(f"- {x}" for x in items[:limit]) or "none"
+    def _bullets(items: list, limit: int = 8) -> str:
+        return "\n".join(f"- {_to_str(x)}" for x in items[:limit]) or "none"
 
     state_str = (
         f"Confirmed findings:\n{_bullets(state.confirmed)}\n\n"
@@ -346,7 +366,9 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
         f"{state_str}\n\n"
         "Based on the above, extract the final paper structure.\n"
         "Use both Japanese and English in descriptions. "
-        f'Set paper_id="{paper_id}".\n\n'
+        f'Set paper_id="{paper_id}".\n'
+        "Also extract: authors (list of author names), year (publication year as integer), "
+        "and domain (target academic domain, e.g. 'ecology', 'economics', 'computer science').\n\n"
         "=== MetaWeave-SMILES DSL Instructions ===\n"
         "You MUST encode all extracted causal relationships (CausalEdge) and variables "
         "into the MetaWeave-SMILES DSL and store the result in abstract_structure.smiles_dsl.\n\n"
@@ -357,28 +379,50 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
         "- PERIPHERAL (is_core=false): Supplementary, contextual, or domain-specific relationships "
         "that provide supporting detail but are not essential to the core mechanism.\n\n"
         "=== CorePredicate (標準述語) — MANDATORY ===\n"
-        "Each CausalEdge MUST set core_predicate to ONE of the following seven standardized values:\n"
+        "Each CausalEdge MUST set core_predicate to ONE of the following nine standardized values:\n"
         "  CAUSES     → one variable directly produces or triggers another\n"
         "  INHIBITS   → one variable suppresses, blocks, or reduces another\n"
         "  CORRELATES → two variables co-vary without clear directionality\n"
         "  DEFINES    → one variable characterizes, specifies, or constitutes another\n"
         "  MEASURES   → one variable operationalizes or quantifies another\n"
         "  TRANSFORMS → one variable converts or changes the state of another\n"
-        "  REQUIRES   → one variable depends on or presupposes another\n\n"
+        "  REQUIRES   → one variable depends on or presupposes another (prerequisite/dependency)\n"
+        "  CONTAINS   → parent-child (macro-micro) inclusion; the source contains the target as a constituent\n"
+        "  EQUIVALENT → equivalence or contrast between concepts at the same hierarchical level (lateral relation)\n\n"
+        "=== Hierarchical & Lateral Relationship Rules ===\n"
+        "- When extracting elements and causal relationships, ALWAYS check where each element sits "
+        "in the paper's overall structure (macro context).\n"
+        "- If an element is a constituent of a larger concept, identify the parent node and link "
+        "them with ==[CONTAINS:contains:+]=> (parent → child).\n"
+        "- If elements share prerequisite/dependency or contrast/equivalence relationships, express "
+        "them as -[REQUIRES:requires:+]-> or -[EQUIVALENT:equals:+]-> lateral edges.\n"
+        "- Do NOT use absolute depth levels. All hierarchy is expressed via relative CONTAINS edges.\n\n"
         "Each CausalEdge MUST also set domain_verb to the original domain-specific verb "
         "(e.g., 'operationalizes', 'structures', 'quantifies', 'induces').\n\n"
         "DSL syntax (IMPORTANT — nodes use parentheses, edges use square brackets):\n"
         "  Core edge:       (varID:OntologyType:value) ==[CorePredicate:domain_verb:polarity]=> (targetVarID:OntologyType:value)\n"
         "  Peripheral edge: (varID:OntologyType:value) -[CorePredicate:domain_verb:polarity]-> (targetVarID:OntologyType:value)\n\n"
+        "=== Polarity Extended Rules ===\n"
+        "polarity accepts four values: '+', '-', '+/-', '?'\n"
+        "- '+' : positive / promoting effect\n"
+        "- '-' : negative / inhibiting effect\n"
+        "- '+/-' : bidirectional or context-dependent (can be positive or negative depending on conditions)\n"
+        "- '?' : impact exists but direction is unknown\n"
+        "Do NOT force '+' or '-' when the relationship is ambiguous. Use '+/-' or '?' instead.\n\n"
         "Examples:\n"
         "  Core:       (a:Agent:Toyota) ==[CAUSES:operationalizes:+]=> (r:Resource:Profit)\n"
         "  Core:       (x:Event:Stress) ==[MEASURES:quantifies:+]=> (y:Resource:CortisalLevel)\n"
-        "  Peripheral: (e:Event:MarketShift) -[CORRELATES:correlates:+]-> (r:Resource:Profit)\n\n"
+        "  Peripheral: (e:Event:MarketShift) -[CORRELATES:correlates:+]-> (r:Resource:Profit)\n"
+        "  Hierarchy:  (th:Resource:TheoreticalFramework) ==[CONTAINS:contains:+]=> (h:Resource:Hypothesis)\n"
+        "  Lateral:    (a:Resource:ConceptA) -[EQUIVALENT:equals:+]-> (b:Resource:ConceptB)\n"
+        "  Lateral:    (p:Resource:Prerequisite) -[REQUIRES:requires:+]-> (m:Event:MainMethod)\n"
+        "  Ambiguous:  (x:Event:Intervention) ==[CAUSES:influences:+/-]=> (y:Resource:Outcome)\n"
+        "  Unknown:    (f:Resource:Factor) -[CORRELATES:associated:?]-> (r:Resource:Result)\n\n"
         "=== [PHASE 1 — ONTOLOGY ENFORCEMENT] OntologyType Mandatory Rules ===\n"
         "CRITICAL: Every single node in the DSL string MUST include OntologyType. "
         "Nodes without OntologyType are INVALID and must be rejected.\n\n"
-        "VALID OntologyType values (UFO-C/REA upper ontology):\n"
-        "  Agent | Resource | Event | Purpose-oriented group | Institutional Agent | Intentional Moment\n\n"
+        "VALID OntologyType values (OSL .isom compliant — exactly 4 types):\n"
+        "  Agent | Event | Resource | Intentional Moment\n\n"
         "ENFORCEMENT CHECKLIST — before finalizing smiles_dsl, verify EVERY node satisfies:\n"
         "  [✓] Format is (varID:OntologyType:ConcreteValue) — all three parts present\n"
         "  [✓] OntologyType is one of the six valid values listed above\n"
@@ -388,16 +432,14 @@ def _finalize_structure(state: _AnalysisState, paper_id: str, license: str = "")
         "  [✓] Back-references (varID) (for cycles) are acceptable only if the variable "
         "was already declared with full (varID:OntologyType:ConcreteValue) earlier in the same DSL string\n\n"
         "Classification guide:\n"
-        "  Agent              → human, organization, institution, actor that initiates action\n"
-        "  Resource           → material, information, capital, output, artifact\n"
+        "  Agent              → human, organization, institution, team, government, legal entity, actor that initiates action\n"
         "  Event              → occurrence, process, phenomenon, dynamic change\n"
-        "  Purpose-oriented group → team, community, project group with shared goal\n"
-        "  Institutional Agent → university, government, standard body, legal entity\n"
-        "  Intentional Moment  → intention, goal, belief, commitment, mental state\n\n"
+        "  Resource           → material, information, capital, output, artifact\n"
+        "  Intentional Moment → intention, goal, belief, commitment, mental state\n\n"
         "Rules:\n"
-        "1. Each variable must be assigned an OntologyType from the six valid values. "
+        "1. Each variable must be assigned an OntologyType from the four valid values. "
         "No exceptions. If uncertain, choose the closest type.\n"
-        "2. Each CausalEdge must specify polarity (+ or -) in both the edge's polarity field "
+        "2. Each CausalEdge must specify polarity (+, -, +/-, or ?) in both the edge's polarity field "
         "and the DSL string.\n"
         "3. Each CausalEdge must specify ontology_level with the relevant ontology relation type.\n"
         "4. Each CausalEdge must set is_core=true for core edges and is_core=false for peripheral edges. "

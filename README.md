@@ -154,11 +154,12 @@ AbstractionPattern(
 
 これにより、システム自身が「次に調べるべき分野」を提案し、パターンライブラリの成長を加速します。
 
-### 5. RAG チャット
+### 5. RAG チャット（構造ドリルダウン対応）
 
 - ユーザーが論文に対して自然言語で質問できる
 - Qdrant でセマンティック検索 → MinIO から構造 JSON 取得 → LLM が回答生成
 - チャット履歴を Neo4j に永続化
+- **説明リンク機能**: LLM が回答末尾に `[〇〇について詳しく聞く]` 形式のドリルダウンリンクを提示。Streamlit UI 上でクリック可能なボタンとして表示され、ボタンを押すと該当概念への質問が自動セットされ、構造を辿りながら学習を深められる
 
 ### 6. ユーザードラフト管理 & パターンプレビューワークフロー
 
@@ -196,6 +197,46 @@ Validation View では論文ごとにバッジで状態を表示します：
 | `[変数名:OntologyType:具体例]` | ノード表現。OntologyType は UFO-C / REA に準拠 |
 | `==[関係:極性]==>` | **コア因果辺**。論文の主眼・骨格となる必須のメカニズム |
 | `-[関係:極性]->` | **周辺因果辺**。測定指標や副次的な影響、前提条件 |
+
+#### CorePredicate（標準述語）
+
+| 述語 | 意味 |
+|------|------|
+| `CAUSES` | 直接的に生成・トリガーする |
+| `INHIBITS` | 抑制・阻害する |
+| `CORRELATES` | 明確な方向性なく共変する |
+| `DEFINES` | 特徴づけ・定義する |
+| `MEASURES` | 数量化・操作化する |
+| `TRANSFORMS` | 状態を変換する |
+| `REQUIRES` | 依存・前提条件とする（並進関係） |
+| `CONTAINS` | 親子関係（マクロ→ミクロの包含）。親ノードが子ノードを構成要素として含む |
+| `EQUIVALENT` | 等価性・対比関係（並進関係）。同階層の概念間の論理的な繋がりを表現 |
+
+#### 極性（Polarity）
+
+| 値 | 意味 |
+|----|------|
+| `+` | 正の影響（促進） |
+| `-` | 負の影響（抑制） |
+| `+/-` | 双方向・条件依存（文脈によって正にも負にも振れる） |
+| `?` | 方向不明（影響の存在は判明しているが正負が未確定） |
+
+#### 階層関係と並進関係 — 絶対的な深さを持たない相対グラフ設計
+
+MetaWeave では、概念間の階層（マクロ・ミクロ）と並進関係（同階層の論理的つながり）をすべて **相対的なエッジ** で表現します。ノードに `depth_level` のような絶対的な深さ属性は持たせません。
+
+```
+理論的枠組み
+├── ==[CONTAINS:contains:+]=> 仮説A
+│   ├── ==[CONTAINS:contains:+]=> 要素X
+│   └── ==[CONTAINS:contains:+]=> 要素Y
+├── ==[CONTAINS:contains:+]=> 仮説B
+│
+仮説A -[REQUIRES:requires:+]-> 前提条件P
+要素X -[EQUIVALENT:equals:+]-> 要素Z（他分野の対応概念）
+```
+
+この設計により、Neo4j のグラフ走査で任意のノードから上位・下位・並列の概念を動的に辿ることが可能です。
 
 #### コア因果辺と周辺因果辺の分離 — 「保存はリッチに、検索はソリッドに」
 
@@ -390,7 +431,8 @@ metaweave/
 |--------|------|
 | `PaperStructure` | 論文から抽出した構造（正典） |
 | `AbstractStructure` | 変数・エッジ・SMILES DSL を含む抽象構造 |
-| `CausalEdge` | 因果エッジ（`polarity`, `ontology_level`, `is_core` を含む。コア/周辺の分離を管理） |
+| `CausalEdge` | 因果・関係エッジ（`core_predicate`, `domain_verb`, `polarity`[+/-/+/-/?], `is_core` を含む。CONTAINS/EQUIVALENT で階層・並進関係も表現） |
+| `CorePredicate` | 標準化されたエッジ述語 enum（CAUSES, INHIBITS, CORRELATES, DEFINES, MEASURES, TRANSFORMS, REQUIRES, CONTAINS, EQUIVALENT） |
 | `OntologyType` | UFO-C / REA に基づく上位オントロジー型 enum |
 | `FieldDiff` | Diff ベースレビューの単一フィールド差分（field_path / base_value / proposed_value） |
 | `AbstractionPattern` | 抽象化された問題解決パターン |
@@ -411,6 +453,7 @@ Diff ベースマージ関数も実装：
 #### `embedder.py` — FANNS 検索エンジン
 
 - `search_fanns_hybrid(dsl_regex, query_text, top_k)` — DSL 正規表現 Pre-filtering + ベクトル検索のハイブリッド検索（実装完了）
+- `embed_and_store()` — チャンク埋め込み時に CONTAINS エッジから祖先マップ（`ancestors`）を自動構築し Qdrant ペイロードに付与。絶対的な `depth_level` は保存せず、相対的な祖先リストにより「特定のマクロテーマに属するノード」のフィルタリングが可能
 
 #### `batch.py` — 同型評価バッチ
 
@@ -530,9 +573,11 @@ Structure Editor は 4 つのタブで構成されています：
 
 これにより、専門用語を知らなくても「この構造に似た問題を扱っている論文」を異分野から発見できます。
 
-**⑦ RAG チャット**
+**⑦ RAG チャット（構造ドリルダウン）**
 
 Validation ページの「💬 Chat」タブで論文に関する質問を自然言語で入力できます。
+LLM は構造データ（CONTAINS / REQUIRES / EQUIVALENT エッジ）を参照し、概念の階層関係や前提知識を体系的に説明します。
+回答末尾に表示される「🔍 〇〇について詳しく聞く」ボタンをクリックすると、関連概念へのドリルダウン質問が自動発火し、構造を辿りながら理解を深められます。
 
 ### API
 
