@@ -2156,7 +2156,7 @@ def _default_course() -> dict:
             {"title": "Peskin & Schroeder",
              "subtitle": "An Introduction to Quantum Field Theory",
              "used_section": "今回参照: §4.7 (Feynman Rules)"},
-            {"title": "KEK 場の量子論 講義ノート",
+            {"title": "場の量子論 講義ノート",
              "subtitle": "2025年度 前期講義", "license": "CC BY 4.0"},
             {"title": "CERN Yellow Report: QFT Lectures",
              "subtitle": "CERN Summer School 2024", "license": "CC BY 4.0"},
@@ -2167,7 +2167,7 @@ def _default_course() -> dict:
             {"source": "Peskin & Schroeder", "section": "§4.2",
              "title": "Perturbation Expansion of Correlation Functions",
              "note": "摂動展開とダイアグラムの対応"},
-            {"source": "KEK 講義ノート", "section": "第5回",
+            {"source": "講義ノート", "section": "第5回",
              "title": "相互作用する場の量子論", "note": "ファインマンダイアグラムの導入"},
         ],
     }
