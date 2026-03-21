@@ -10,13 +10,14 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class OntologyType(str, Enum):
-    """UFO-C / REA に基づく上位オントロジー型。"""
+    """OSL (.isom) 準拠の上位オントロジー型。
+
+    OSL バリデーションに適合させるため、ノード型は以下の 4 種に限定する。
+    """
 
     AGENT = "Agent"
-    RESOURCE = "Resource"
     EVENT = "Event"
-    PURPOSE_ORIENTED_GROUP = "Purpose-oriented group"
-    INSTITUTIONAL_AGENT = "Institutional Agent"
+    RESOURCE = "Resource"
     INTENTIONAL_MOMENT = "Intentional Moment"
 
 
@@ -115,6 +116,9 @@ class PaperStructure(BaseModel):
 
     paper_id: str = Field(description="Unique identifier (e.g. arXiv ID)")
     title: str = Field(default="")
+    authors: list[str] = Field(default_factory=list, description="List of author names")
+    year: Optional[int] = Field(default=None, description="Publication year")
+    domain: str = Field(default="", description="Target academic domain (e.g. 'ecology', 'economics')")
     problem: ProblemStatement = Field(default_factory=ProblemStatement)
     hypothesis: Hypothesis = Field(default_factory=Hypothesis)
     methodology: Methodology = Field(default_factory=Methodology)

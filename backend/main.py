@@ -47,6 +47,7 @@ from metaweave import extractor as ext
 from metaweave.batch import run_pattern_evaluation_task
 from metaweave.chat import generate_chat_response
 from metaweave.db import create_system_meta_proposal, get_driver
+from metaweave.isom import serialize_isom, write_isom_file, write_batch_isom
 from metaweave.embedder import embed_and_store_pattern, search_fanns_hybrid
 from metaweave.harvester import PaperMeta, fetch_and_store, search_arxiv
 from metaweave.llm import generate_missing_link_suggestions, get_client, get_settings
@@ -488,6 +489,13 @@ def _run_extraction_task(
                 length=len(json_bytes),
                 content_type="application/json",
             )
+            # 3c. .isom ファイルを output/incoming/ に書き出し
+            try:
+                write_isom_file(structure)
+            except Exception:
+                logger.warning(
+                    "Failed to write .isom file for %s (continuing)", arxiv_id, exc_info=True
+                )
             logger.info("Background extraction completed for %s", arxiv_id)
 
         with _job_lock:
@@ -1888,3 +1896,57 @@ def export_public_github(
         )
 
     return PublicExportResponse(records=records, dropped_count=dropped)
+
+
+# ---------------------------------------------------------------------------
+# Batch .isom export endpoint
+# ---------------------------------------------------------------------------
+
+
+class IsomExportResponse(BaseModel):
+    """Response for POST /api/export/isom."""
+
+    files_written: list[str]
+    count: int
+
+
+@app.post("/api/export/isom", response_model=IsomExportResponse)
+def export_isom_batch(
+    current_user: dict = Depends(_get_current_user),
+) -> IsomExportResponse:
+    """Batch export: write all extracted structures as individual .isom files.
+
+    Each paper's structure is written to output/incoming/ as
+    temp_[source_id_hash].isom for downstream OSL processing.
+    License-contaminated records (NC/ND) are excluded.
+    """
+    sm = StorageManager()
+    bucket = "extracted-structures"
+
+    try:
+        objects = sm.client.list_objects(bucket, recursive=True)
+        object_names = [obj.object_name for obj in objects]
+    except Exception:
+        logger.warning("Failed to list objects in bucket=%s", bucket)
+        object_names = []
+
+    structures: list[PaperStructure] = []
+    for obj_name in object_names:
+        try:
+            resp = sm.client.get_object(bucket, obj_name)
+            raw = resp.read()
+            resp.close()
+            resp.release_conn()
+            ps = PaperStructure.model_validate_json(raw)
+        except Exception:
+            logger.warning("Skipping unparseable object %s", obj_name)
+            continue
+
+        # Skip license-contaminated records
+        if _LICENSE_CONTAMINATION_RE.search(ps.license):
+            continue
+
+        structures.append(ps)
+
+    paths = write_batch_isom(structures)
+    return IsomExportResponse(files_written=paths, count=len(paths))
