@@ -167,6 +167,19 @@ def api_fetch(paper: dict) -> str:
     return resp.json()["object_name"]
 
 
+def api_upload_pdf(file_data: bytes, filename: str, source_url: str = "", license: str = "") -> dict:
+    """POST /api/upload-pdf — upload a local PDF file. Returns {paper_id, object_name}."""
+    resp = requests.post(
+        f"{BACKEND_URL}/api/upload-pdf",
+        files={"file": (filename, file_data, "application/pdf")},
+        data={"source_url": source_url, "license": license},
+        headers=_auth_headers(),
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def api_presigned_url(object_name: str) -> str:
     resp = requests.get(
         f"{BACKEND_URL}/api/presigned-url",
@@ -597,6 +610,56 @@ with st.sidebar:
     st.markdown("## MetaWeave v1")
     st.caption(f"👤 {st.session_state.username}")
     page = st.radio("Navigation", ["Harvester Dashboard", "Validation View", "Pattern Library", "Cross-Domain Search", "🛠️ Meta Issues"])
+
+    # ── PDF Upload section ─────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📄 PDF アップロード")
+    _uploaded_file = st.file_uploader(
+        "PDFファイルを選択",
+        type=["pdf"],
+        key="pdf_uploader",
+        label_visibility="collapsed",
+    )
+    _upload_source_url = st.text_input(
+        "入手元 URL（任意）",
+        placeholder="https://example.com/paper.pdf",
+        key="upload_source_url",
+    )
+    _upload_license = st.text_input(
+        "ライセンス（任意）",
+        placeholder="CC-BY-4.0 など",
+        key="upload_license",
+    )
+    if st.button("📤 アップロード & 解析開始", key="btn_upload_pdf", use_container_width=True, disabled=_uploaded_file is None):
+        if _uploaded_file is not None:
+            try:
+                with st.spinner("アップロード中…"):
+                    _pdf_bytes = _uploaded_file.read()
+                    _upload_resp = api_upload_pdf(
+                        _pdf_bytes,
+                        _uploaded_file.name,
+                        source_url=_upload_source_url,
+                        license=_upload_license,
+                    )
+                    _up_paper_id = _upload_resp["paper_id"]
+                    _up_object_name = _upload_resp["object_name"]
+                    st.session_state.stored_papers[_up_paper_id] = _up_object_name
+                    _up_title = _uploaded_file.name.rsplit(".", 1)[0]
+                    st.session_state.paper_metadata[_up_paper_id] = {
+                        "title": _up_title,
+                        "source_url": _upload_source_url,
+                        "license": _upload_license,
+                    }
+                # 非同期抽出ジョブをキュー登録
+                api_extract(_up_object_name, _up_paper_id, license=_upload_license)
+                st.session_state.processing_papers[_up_paper_id] = {
+                    "title": _up_title,
+                    "object_name": _up_object_name,
+                }
+                st.toast(f"⏳ 「{_up_title}」 の解析を開始しました")
+                st.rerun()
+            except Exception as _e:
+                st.error(f"アップロードに失敗しました: {_e}")
 
     # ── Data Management (Export) section ─────────────────────────────────
     st.divider()
